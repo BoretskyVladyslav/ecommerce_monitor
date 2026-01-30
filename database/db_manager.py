@@ -39,6 +39,26 @@ class DatabaseManager:
                         raise
         return self._pool
 
+    async def init_db(self):
+        """Initializes the database by running schema.sql."""
+        pool = await self.get_pool()
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                try:
+                    with open('database/schema.sql', 'r') as f:
+                        schema = f.read()
+                    
+                    # Split by semi-colon to execute multiple statements
+                    statements = [s.strip() for s in schema.split(';') if s.strip()]
+                    
+                    for statement in statements:
+                        await cursor.execute(statement)
+                        
+                    logger.info("Database initialized (schema updated).")
+                except Exception as e:
+                    logger.error(f"Failed to initialize database: {e}")
+                    raise
+
     async def fetch_all(self, query: str, params: tuple = None) -> List[Dict[str, Any]]:
         """Executes a SELECT query and returns a list of dictionaries."""
         pool = await self.get_pool()
@@ -78,6 +98,29 @@ class DatabaseManager:
             WHERE po.status != 0
         """
         return await self.fetch_all(query)
+
+    async def get_available_session(self, marketplace: str) -> Optional[Dict[str, Any]]:
+        """
+        Finds a 'Ready' session for the given marketplace.
+        """
+        query = """
+            SELECT * FROM sessions 
+            WHERE type = %s AND status = 'Ready'
+            ORDER BY last_active ASC
+            LIMIT 1
+        """
+        sessions = await self.fetch_all(query, (marketplace,))
+        return sessions[0] if sessions else None
+
+    async def update_session_status(self, session_id: int, status: str):
+        """Updates status and last_active for a session."""
+        query = """
+            UPDATE sessions 
+            SET status = %s, last_active = NOW()
+            WHERE id = %s
+        """
+        await self.execute(query, (status, session_id))
+
 
     async def close(self):
         """Closes the connection pool."""

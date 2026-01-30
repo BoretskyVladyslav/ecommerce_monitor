@@ -7,3 +7,6 @@ cryptography
 psutil
 pandas
 openpyxl
+customtkinter
+packaging
+Pillow

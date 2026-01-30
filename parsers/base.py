@@ -2,11 +2,54 @@ from abc import ABC
 from playwright.async_api import Page
 import asyncio
 from config.logger import setup_logger
+from parsers.exceptions import SoftBanException, HardBanException
 
 class BaseParser(ABC):
     def __init__(self, page: Page):
         self.page = page
         self.logger = setup_logger(self.__class__.__name__)
+
+    async def check_for_captcha(self):
+        """
+        Scenario B: Error Handling
+        Checks for typical captcha/block indicators.
+        Raises SoftBanException for recoverable captchas.
+        Raises HardBanException for critical blocks.
+        """
+        # Dictionary of selectors -> Exception Type
+        # This is generic; in real world, move to specific parsers or pass as config
+        indicators = {
+            "text='Enter the characters you see below'": "SoftBan", # Amazon
+            "text='Verify you are human'": "SoftBan",              # Cloudflare/Others
+            "text='Access Denied'": "HardBan",
+            "text='banned'": "HardBan"
+        }
+
+        for selector, ban_type in indicators.items():
+            if await self.page.locator(selector).is_visible(timeout=1000):
+                if ban_type == "SoftBan":
+                    # Attempt simple solve or wait logic
+                    self.logger.warning("Soft Ban / Captcha detected.")
+                    
+                    # Try to click "Verify human" if it's a simple button
+                    try:
+                        verify_btn = self.page.locator("text='Verify human'")
+                        if await verify_btn.is_visible():
+                             await verify_btn.click()
+                             await asyncio.sleep(5)
+                             # Re-check?
+                             if not await self.page.locator(selector).is_visible(timeout=1000):
+                                 self.logger.info("Soft Ban seemingly resolved.")
+                                 return
+                    except:
+                        pass
+                        
+                    raise SoftBanException("Captcha detected")
+                
+                elif ban_type == "HardBan":
+                    self.logger.error("Hard Ban / Access Denied detected.")
+                    raise HardBanException("Access Denied")
+
 
     async def Maps(self, url: str):
         """
