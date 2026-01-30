@@ -1,0 +1,9 @@
+playwright>=1.40.0
+aiomysql>=0.2.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+python-dotenv>=1.0.0
+cryptography
+psutil
+pandas
+openpyxl
