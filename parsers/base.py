@@ -12,43 +12,60 @@ class BaseParser(ABC):
     async def check_for_captcha(self):
         """
         Scenario B: Error Handling
-        Checks for typical captcha/block indicators.
+        Checks for typical captcha/block indicators across all platforms.
         Raises SoftBanException for recoverable captchas.
         Raises HardBanException for critical blocks.
         """
-        # Dictionary of selectors -> Exception Type
-        # This is generic; in real world, move to specific parsers or pass as config
+        # Comprehensive captcha/ban indicators
         indicators = {
-            "text='Enter the characters you see below'": "SoftBan", # Amazon
-            "text='Verify you are human'": "SoftBan",              # Cloudflare/Others
+            # Generic captchas
+            "text='Enter the characters you see below'": "SoftBan",  # Amazon
+            "text='Verify you are human'": "SoftBan",                # Cloudflare
+            "text='Please verify'": "SoftBan",
+            "text='Security verification'": "SoftBan",
+            "text='Security check'": "SoftBan",
+            "text='Unusual activity'": "SoftBan",
+            
+            # Shein specific
+            "text='Slide to verify'": "SoftBan",
+            "text='Verify to continue'": "SoftBan",
+            "#captcha": "SoftBan",
+            "iframe[src*='captcha']": "SoftBan",
+            "div[class*='captcha']": "SoftBan",
+            
+            # Temu specific
+            ".security-verify": "SoftBan",
+            "text='Drag the slider'": "SoftBan",
+            "div[class*='slider-verify']": "SoftBan",
+            
+            # AliExpress specific
+            "text='Click to verify'": "SoftBan",
+            "#nc_1__scale_text": "SoftBan",  # AliExpress slider
+            
+            # Hard bans
             "text='Access Denied'": "HardBan",
-            "text='banned'": "HardBan"
+            "text='banned'": "HardBan",
+            "text='Your account has been suspended'": "HardBan",
+            "text='403 Forbidden'": "HardBan",
         }
 
         for selector, ban_type in indicators.items():
-            if await self.page.locator(selector).is_visible(timeout=1000):
-                if ban_type == "SoftBan":
-                    # Attempt simple solve or wait logic
-                    self.logger.warning("Soft Ban / Captcha detected.")
+            try:
+                is_visible = await self.page.locator(selector).is_visible(timeout=1000)
+                if is_visible:
+                    if ban_type == "SoftBan":
+                        self.logger.warning(f"🚫 Captcha detected: {selector}")
+                        raise SoftBanException(f"Captcha: {selector}")
                     
-                    # Try to click "Verify human" if it's a simple button
-                    try:
-                        verify_btn = self.page.locator("text='Verify human'")
-                        if await verify_btn.is_visible():
-                             await verify_btn.click()
-                             await asyncio.sleep(5)
-                             # Re-check?
-                             if not await self.page.locator(selector).is_visible(timeout=1000):
-                                 self.logger.info("Soft Ban seemingly resolved.")
-                                 return
-                    except:
-                        pass
-                        
-                    raise SoftBanException("Captcha detected")
-                
-                elif ban_type == "HardBan":
-                    self.logger.error("Hard Ban / Access Denied detected.")
-                    raise HardBanException("Access Denied")
+                    elif ban_type == "HardBan":
+                        self.logger.error(f"❌ Hard Ban detected: {selector}")
+                        raise HardBanException(f"Access Denied: {selector}")
+            except Exception as e:
+                # Якщо помилка не від нашого raise - ігноруємо
+                if isinstance(e, (SoftBanException, HardBanException)):
+                    raise
+                # Інші помилки (timeout тощо) - пропускаємо
+                continue
 
 
     async def Maps(self, url: str):

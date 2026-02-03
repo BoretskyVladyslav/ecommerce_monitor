@@ -48,3 +48,11 @@ Thumbs.db
 
 # Project specific
 sessions/
+*_session_state.json
+*_session_proxy.json
+proxies.txt
+warmup_history.json
+proxy_geo_cache.json
+
+# Tests
+test_*.py

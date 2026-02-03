@@ -1,65 +1,137 @@
 import customtkinter as ctk
+from config.settings import settings
 
 class SettingsModal(ctk.CTkToplevel):
-    def __init__(self, master):
-        super().__init__(master)
-        self.title("Settings")
-        self.geometry("400x500")
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Configuration")
+        self.geometry("500x550")
+        self.resizable(False, False)
         
-        # Make modal
-        self.transient(master)
-        self.grab_set()
+        # Center the window
+        self.update_idletasks()
+        width = self.winfo_width()
+        height = self.winfo_height()
+        x = (self.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.winfo_screenheight() // 2) - (height // 2)
+        self.geometry(f"+{x}+{y}")
         
-        self.grid_columnconfigure(1, weight=1)
+        self.grab_set() 
         
-        # Threads
-        ctk.CTkLabel(self, text="Threads:").grid(row=0, column=0, padx=10, pady=10, sticky="w")
-        self.entry_threads = ctk.CTkEntry(self)
-        self.entry_threads.grid(row=0, column=1, padx=10, pady=10, sticky="ew")
-        self.entry_threads.insert(0, "1")
+        self.fields = {} # Store entry widgets
 
-        # Delay Min
-        ctk.CTkLabel(self, text="Min Delay (sec):").grid(row=1, column=0, padx=10, pady=10, sticky="w")
-        self.entry_delay_min = ctk.CTkEntry(self)
-        self.entry_delay_min.grid(row=1, column=1, padx=10, pady=10, sticky="ew")
-        self.entry_delay_min.insert(0, "2")
+        # Scrollable Frame for settings
+        self.scroll = ctk.CTkScrollableFrame(self)
+        self.scroll.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        # ==========================
+        # 1. DATABASE SETTINGS
+        # ==========================
+        ctk.CTkLabel(self.scroll, text="Database Settings", font=("Arial", 14, "bold"), text_color="#3498db").pack(anchor="w", pady=(10, 5))
+        
+        self.add_field("DB Host:", "db_host", settings.DB_HOST)
+        self.add_field("DB Port:", "db_port", str(settings.DB_PORT))
+        self.add_field("DB User:", "db_user", settings.DB_USER)
+        self.add_field("DB Password:", "db_pass", settings.DB_PASSWORD, is_password=True)
+        self.add_field("DB Name:", "db_name", settings.DB_NAME)
 
-        # Delay Max
-        ctk.CTkLabel(self, text="Max Delay (sec):").grid(row=2, column=0, padx=10, pady=10, sticky="w")
-        self.entry_delay_max = ctk.CTkEntry(self)
-        self.entry_delay_max.grid(row=2, column=1, padx=10, pady=10, sticky="ew")
-        self.entry_delay_max.insert(0, "5")
+        # ==========================
+        # 2. APPLICATION SETTINGS
+        # ==========================
+        ctk.CTkLabel(self.scroll, text="Application Settings", font=("Arial", 14, "bold"), text_color="#3498db").pack(anchor="w", pady=(20, 5))
+        
+        self.add_field("Threads (Concurrent Checks):", "threads", str(settings.THREADS))
+        
+        # Headless Checkbox
+        self.var_headless = ctk.BooleanVar(value=settings.HEADLESS)
+        container = ctk.CTkFrame(self.scroll, fg_color="transparent")
+        container.pack(fill="x", pady=5)
+        ctk.CTkLabel(container, text="Headless Mode (Hidden Browser):", width=200, anchor="w").pack(side="left")
+        ctk.CTkCheckBox(container, text="", variable=self.var_headless).pack(side="left")
+        
+        # ==========================
+        # 3. PLATFORM CONTROL
+        # ==========================
+        ctk.CTkLabel(self.scroll, text="Platform Control (Kill Switches)", font=("Arial", 14, "bold"), text_color="#3498db").pack(anchor="w", pady=(20, 5))
+        
+        # Temu Checkbox
+        self.var_enable_temu = ctk.BooleanVar(value=settings.ENABLE_TEMU)
+        container_temu = ctk.CTkFrame(self.scroll, fg_color="transparent")
+        container_temu.pack(fill="x", pady=5)
+        ctk.CTkLabel(container_temu, text="Enable Temu:", width=200, anchor="w").pack(side="left")
+        ctk.CTkCheckBox(container_temu, text="", variable=self.var_enable_temu).pack(side="left")
+        
+        # Shein Checkbox
+        self.var_enable_shein = ctk.BooleanVar(value=settings.ENABLE_SHEIN)
+        container_shein = ctk.CTkFrame(self.scroll, fg_color="transparent")
+        container_shein.pack(fill="x", pady=5)
+        ctk.CTkLabel(container_shein, text="Enable Shein:", width=200, anchor="w").pack(side="left")
+        ctk.CTkCheckBox(container_shein, text="", variable=self.var_enable_shein).pack(side="left")
+        
+        # AliExpress Checkbox
+        self.var_enable_aliexpress = ctk.BooleanVar(value=settings.ENABLE_ALIEXPRESS)
+        container_aliexpress = ctk.CTkFrame(self.scroll, fg_color="transparent")
+        container_aliexpress.pack(fill="x", pady=5)
+        ctk.CTkLabel(container_aliexpress, text="Enable AliExpress:", width=200, anchor="w").pack(side="left")
+        ctk.CTkCheckBox(container_aliexpress, text="", variable=self.var_enable_aliexpress).pack(side="left")
+        
+        self.add_field("Min Delay (sec):", "delay_min", str(settings.DELAY_MIN))
+        self.add_field("Max Delay (sec):", "delay_max", str(settings.DELAY_MAX))
 
-        # Session Pause
-        ctk.CTkLabel(self, text="Session Pause (sec):").grid(row=3, column=0, padx=10, pady=10, sticky="w")
-        self.entry_pause = ctk.CTkEntry(self)
-        self.entry_pause.grid(row=3, column=1, padx=10, pady=10, sticky="ew")
-        self.entry_pause.insert(0, "60")
-
-        # Human Mode
-        self.check_human = ctk.CTkCheckBox(self, text="Enable Human Mode (Deep Emulation)")
-        self.check_human.grid(row=4, column=0, columnspan=2, padx=10, pady=20)
 
         # Save Button
-        self.btn_save = ctk.CTkButton(self, text="Save Settings", command=self.on_save)
-        self.btn_save.grid(row=5, column=0, columnspan=2, padx=10, pady=20)
+        self.btn_save = ctk.CTkButton(self, text="Save Configuration", command=self.on_save, height=40, font=("Arial", 14, "bold"))
+        self.btn_save.pack(fill="x", padx=20, pady=20)
         
-        self.load_current_settings()
-
-    def load_current_settings(self):
-        # TODO: Load from Database
-        pass
+    def add_field(self, label_text, key, default_val, is_password=False):
+        container = ctk.CTkFrame(self.scroll, fg_color="transparent")
+        container.pack(fill="x", pady=2)
+        
+        ctk.CTkLabel(container, text=label_text, width=150, anchor="w").pack(side="left")
+        
+        entry = ctk.CTkEntry(container, show="*" if is_password else "")
+        entry.insert(0, str(default_val))
+        entry.pack(side="left", fill="x", expand=True)
+        
+        if not hasattr(self, 'fields'): self.fields = {}
+        self.fields[key] = entry
 
     def on_save(self):
-        # TODO: Save to Database
+        # Update Settings Object
         try:
-            threads = int(self.entry_threads.get())
-            d_min = int(self.entry_delay_min.get())
-            d_max = int(self.entry_delay_max.get())
-            pause = int(self.entry_pause.get())
-            human = self.check_human.get()
+            settings.DB_HOST = self.fields['db_host'].get()
+            settings.DB_PORT = int(self.fields['db_port'].get())
+            settings.DB_USER = self.fields['db_user'].get()
+            settings.DB_PASSWORD = self.fields['db_pass'].get()
+            settings.DB_NAME = self.fields['db_name'].get()
             
-            print(f"Saving Settings: Threads={threads}, Delay={d_min}-{d_max}, Pause={pause}, Human={human}")
+            settings.THREADS = int(self.fields['threads'].get())
+            settings.HEADLESS = self.var_headless.get()
+            settings.DELAY_MIN = int(self.fields['delay_min'].get())
+            settings.DELAY_MAX = int(self.fields['delay_max'].get())
+            
+            # Platform Control
+            settings.ENABLE_TEMU = self.var_enable_temu.get()
+            settings.ENABLE_SHEIN = self.var_enable_shein.get()
+            settings.ENABLE_ALIEXPRESS = self.var_enable_aliexpress.get()
+            
+            # Update MAX_CONCURRENT_BROWSERS to match THREADS for logic consistency
+            settings.MAX_CONCURRENT_BROWSERS = settings.THREADS
+            
+            # --- Persist to Database (Async in background) ---
+            import threading
+            import asyncio
+            from utils.config_manager import ConfigManager
+            
+            def save_to_db_task():
+                try:
+                    asyncio.run(ConfigManager.save_all_settings())
+                except Exception as ex:
+                    print(f"DB Save Error: {ex}")
+            
+            threading.Thread(target=save_to_db_task, daemon=True).start()
+            
+            print("✅ Configuration Saved Successfully")
             self.destroy()
-        except ValueError:
-            print("Invalid input values")
+        except ValueError as e:
+            print(f"❌ Error saving settings: {e}")

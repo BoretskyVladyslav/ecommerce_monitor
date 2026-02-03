@@ -14,8 +14,22 @@ class Settings:
 
     MAX_CONCURRENT_BROWSERS: int = 2
     BROWSER_TIMEOUT: int = 30000  
-    HEADLESS: bool = True  
+    HEADLESS: bool = False  
 
     PROXY_URL: str = None
+    
+    # Proxy Country Filtering (empty list = all countries allowed)
+    # Example: ["US", "GB", "DE", "FR"] for USA, UK, Germany, France
+    PROXY_ALLOWED_COUNTRIES: list = ["US"]  # Only USA proxies
+    
+    # User Preferences
+    THREADS: int = 5
+    DELAY_MIN: int = 2
+    DELAY_MAX: int = 5
+    
+    # Platform Control (Kill Switches)
+    ENABLE_TEMU: bool = False       # Temu: Disabled by default
+    ENABLE_SHEIN: bool = True       # Shein: Active
+    ENABLE_ALIEXPRESS: bool = True  # AliExpress: Active
 
 settings = Settings()

@@ -30,12 +30,15 @@ CREATE TABLE IF NOT EXISTS products_log (
 );
 
 CREATE TABLE IF NOT EXISTS settings (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    threads INT DEFAULT 1,
-    delay_min INT DEFAULT 2,
-    delay_max INT DEFAULT 5,
-    session_pause INT DEFAULT 60,
-    human_mode TINYINT(1) DEFAULT 0
+    setting_key VARCHAR(50) PRIMARY KEY,
+    setting_value TEXT
 );
 
-INSERT IGNORE INTO settings (id, threads, delay_min, delay_max, session_pause, human_mode) VALUES (1, 1, 2, 5, 60, 0);
+-- Insert default values if they don't exist
+INSERT IGNORE INTO settings (setting_key, setting_value) VALUES 
+('threads', '1'),
+('headless', '0'),
+('delay_min', '2'),
+('delay_max', '5'),
+('session_pause', '60'),
+('human_mode', '0');

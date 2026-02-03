@@ -12,12 +12,16 @@ async def init_services():
     try:
         db = DatabaseManager()
         await db.init_db()
-        await db.close() # Close pool to reset for other threads
         logger.info("Database initialized.")
     except Exception as e:
         logger.critical(f"Failed to init services: {e}")
 
 def main():
+    # Load Settings from DB BEFORE starting async services
+    # This is now synchronous and safe
+    from utils.config_manager import ConfigManager
+    ConfigManager.load_settings()
+    
     # Run async init in a way that doesn't conflict with mainloop if possible
     # Or just run it before GUI starts.
     # Since init_db is async, we can run it using asyncio.run() briefly.
