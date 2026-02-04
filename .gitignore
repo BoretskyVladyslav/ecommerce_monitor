@@ -54,5 +54,24 @@ proxies.txt
 warmup_history.json
 proxy_geo_cache.json
 
+# Captcha (API keys and screenshots)
+config/captcha_config.json
+captcha_screenshots/
+*.png
+
 # Tests
 test_*.py
+
+# PyInstaller / Build
+output/
+build/
+dist/
+*.spec
+
+# CapMonster
+capmonster.json
+
+browsers/
+*.bat
+*.exe
+*.md

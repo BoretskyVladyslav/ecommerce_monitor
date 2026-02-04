@@ -9,8 +9,17 @@ from config.settings import settings
 try:
     from playwright_stealth import stealth_async
 except ImportError:
-    # Fallback for playwright-stealth 2.0.1+
-    from playwright_stealth import Stealth
+    try:
+        # Fallback for playwright-stealth 2.0.1+
+        from playwright_stealth import Stealth
+        stealth_async = None
+    except Exception as e:
+        print(f"⚠️ Playwright Stealth Import Error (Fallback): {e}")
+        Stealth = None
+        stealth_async = None
+except Exception as e:
+    print(f"⚠️ Playwright Stealth Import Error: {e}")
+    Stealth = None
     stealth_async = None
 
 class BrowserManager:
@@ -29,19 +38,24 @@ class BrowserManager:
         # Mobile User Agent (iPhone with iOS 16.6) - matches cookie generation script
         self.mobile_user_agent = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
 
-    async def get_context(self, playwright: Playwright, session_data: Dict = None, block_resources: bool = False, mobile_mode: bool = False, block_images: bool = True) -> BrowserContext:
+    async def get_context(self, playwright: Playwright, session_data: Dict = None, block_resources: bool = False, mobile_mode: bool = False, block_images: bool = True, simplified: bool = False) -> BrowserContext:
         """
         Creates and returns a new BrowserContext.
         If session_data is provided, uses its Proxy, UA and loads Cookies.
         if block_resources is True, blocks images, fonts, media.
         if mobile_mode is True, emulates iPhone 13 Pro (for sites requiring login on desktop).
         if block_images is True (default), blocks all images to save traffic.
+        if simplified is True, disables advanced stealth and complex headers (for AliExpress).
         """
         # Default options
         launch_options = {
             "headless": settings.HEADLESS, 
             "args": ["--disable-blink-features=AutomationControlled"]
         }
+        
+        if simplified:
+            # Simplified mode mimics the user's successful script
+            launch_options["slow_mo"] = 100
         
         user_agent = None
         
@@ -79,8 +93,20 @@ class BrowserManager:
 
         browser = await playwright.chromium.launch(**launch_options)
         
-        # Mobile Mode: iPhone 13 Pro Emulation
-        if mobile_mode:
+        if simplified:
+             # SIMPLIFIED MODE (AliExpress Fix)
+             # Use minimal overrides. Let Playwright be Playwright.
+             context_args = {
+                "viewport": {"width": 1280, "height": 720}, # Standard desktop
+                "device_scale_factor": 1,
+                "locale": "en-US",
+                "ignore_https_errors": True, # Critical from user script
+                # Do NOT force complex headers or specific timezone if not needed
+             }
+             if user_agent:
+                 context_args["user_agent"] = user_agent
+                 
+        elif mobile_mode:
             context_args = {
                 "viewport": {"width": 390, "height": 844},
                 "device_scale_factor": 3,
@@ -181,17 +207,19 @@ class BrowserManager:
                 except Exception as e:
                     print(f"Failed to load cookies: {e}")
 
-        # Enhanced Anti-detect script
-        await context.add_init_script("""
-            // Hide webdriver traces
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            
-            // Spoof plugins (real Chrome has them, bots often don't)
-            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
-            
-            // Spoof languages to match headers
-            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-        """)
+        # Value add: simplified mode skips weird JS injections that might flag us
+        if not simplified:
+            # Enhanced Anti-detect script
+            await context.add_init_script("""
+                // Hide webdriver traces
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                
+                // Spoof plugins (real Chrome has them, bots often don't)
+                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
+                
+                // Spoof languages to match headers
+                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+            """)
         
         # Apply playwright-stealth (CRITICAL for Shein/Temu)
         # This patches many more detection vectors automatically
@@ -200,12 +228,13 @@ class BrowserManager:
             temp_page = await context.new_page()
             
             # playwright-stealth 2.0.1+ uses Stealth class
-            if stealth_async is None:
-                from playwright_stealth import Stealth
-                stealth = Stealth()
-                await stealth.apply_stealth_async(temp_page)
-            else:
-                await stealth_async(temp_page)
+            if not simplified:
+                if stealth_async is None:
+                    from playwright_stealth import Stealth
+                    stealth = Stealth()
+                    await stealth.apply_stealth_async(temp_page)
+                else:
+                    await stealth_async(temp_page)
             
             await temp_page.close()
             self.log_debug("✅ Playwright-stealth applied successfully")

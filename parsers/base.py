@@ -1,71 +1,364 @@
 from abc import ABC
 from playwright.async_api import Page
 import asyncio
+import random
 from config.logger import setup_logger
 from parsers.exceptions import SoftBanException, HardBanException
+from utils.captcha_detector import captcha_detector
+from utils.captcha_solver import captcha_solver
 
 class BaseParser(ABC):
     def __init__(self, page: Page):
         self.page = page
         self.logger = setup_logger(self.__class__.__name__)
+        # Визначаємо платформу на основі класу
+        if "AliExpress" in self.__class__.__name__:
+            self.marketplace = "aliexpress"
+        elif "Shein" in self.__class__.__name__:
+            self.marketplace = "shein"
+        elif "Temu" in self.__class__.__name__:
+            self.marketplace = "temu"
+        else:
+            self.marketplace = "unknown"
 
     async def check_for_captcha(self):
         """
-        Scenario B: Error Handling
-        Checks for typical captcha/block indicators across all platforms.
-        Raises SoftBanException for recoverable captchas.
-        Raises HardBanException for critical blocks.
+        Checks for captchas using CaptchaDetector.
+        Attempts to solve if detected.
+        Raises SoftBanException if solve fails or hard ban detected.
         """
-        # Comprehensive captcha/ban indicators
-        indicators = {
-            # Generic captchas
-            "text='Enter the characters you see below'": "SoftBan",  # Amazon
-            "text='Verify you are human'": "SoftBan",                # Cloudflare
-            "text='Please verify'": "SoftBan",
-            "text='Security verification'": "SoftBan",
-            "text='Security check'": "SoftBan",
-            "text='Unusual activity'": "SoftBan",
+        # 1. Quick check (fastest)
+        is_captcha = await captcha_detector.quick_check(self.page, self.marketplace)
+        
+        if is_captcha:
+            self.logger.warning(f"🚫 Captcha detected on {self.marketplace}!")
             
-            # Shein specific
-            "text='Slide to verify'": "SoftBan",
-            "text='Verify to continue'": "SoftBan",
-            "#captcha": "SoftBan",
-            "iframe[src*='captcha']": "SoftBan",
-            "div[class*='captcha']": "SoftBan",
-            
-            # Temu specific
-            ".security-verify": "SoftBan",
-            "text='Drag the slider'": "SoftBan",
-            "div[class*='slider-verify']": "SoftBan",
-            
-            # AliExpress specific
-            "text='Click to verify'": "SoftBan",
-            "#nc_1__scale_text": "SoftBan",  # AliExpress slider
-            
-            # Hard bans
-            "text='Access Denied'": "HardBan",
-            "text='banned'": "HardBan",
-            "text='Your account has been suspended'": "HardBan",
-            "text='403 Forbidden'": "HardBan",
-        }
-
-        for selector, ban_type in indicators.items():
+            # --- DEBUG: Introspect Recaptcha Widget ---
             try:
-                is_visible = await self.page.locator(selector).is_visible(timeout=1000)
-                if is_visible:
-                    if ban_type == "SoftBan":
-                        self.logger.warning(f"🚫 Captcha detected: {selector}")
-                        raise SoftBanException(f"Captcha: {selector}")
-                    
-                    elif ban_type == "HardBan":
-                        self.logger.error(f"❌ Hard Ban detected: {selector}")
-                        raise HardBanException(f"Access Denied: {selector}")
+                self.logger.info("🐞 DEBUG: Inspecting Recaptcha Widget...")
+                # Перевіряємо наявність фреймів для дебагу
+                frames = self.page.frames
+                self.logger.info(f"🐞 Found {len(frames)} frames.")
+                for f in frames:
+                    if "acs.aliexpress" in f.url or "recaptcha" in f.url:
+                        self.logger.info(f"🐞 Frame found: {f.url}")
             except Exception as e:
-                # Якщо помилка не від нашого raise - ігноруємо
-                if isinstance(e, (SoftBanException, HardBanException)):
-                    raise
-                # Інші помилки (timeout тощо) - пропускаємо
-                continue
+                self.logger.error(f"🐞 Debug inspection failed: {e}")
+            # --- END DEBUG ---
+
+            # 2. Try to solve
+            solved = await self.solve_captcha()
+            
+            if not solved:
+                 # If solve failed, raise SoftBan to rotate proxy
+                raise SoftBanException(f"Captcha detected and solve failed on {self.marketplace}")
+                
+            self.logger.info("✅ Captcha solved! Continuing...")
+
+    async def solve_captcha(self) -> bool:
+        """
+        Attempts to solve the detected captcha using CaptchaSolver and SliderSolver.
+        """
+        try:
+            # 1. Full detection with screenshot
+            info = await captcha_detector.detect(self.page, self.marketplace, take_screenshot=True)
+            
+            if not info.detected:
+                self.logger.info("Captcha disappeared during detailed check.")
+                return True
+                
+            self.logger.info(f"🧩 Solving {info.captcha_type}...")
+            
+            # 2. Get solution from API
+            solve_params = {"page_url": self.page.url}
+            if info.additional_data:
+                solve_params.update(info.additional_data)
+                
+            solution = await captcha_solver.solve(
+                captcha_type=info.captcha_type,
+                image_path=info.screenshot_path,
+                additional_params=solve_params
+            )
+            
+            if not solution.solved:
+                self.logger.error("❌ Auto-solver failed to get solution.")
+                return False
+                
+            # 3. Apply solution
+            self.logger.info(f"🛠️ Applying solution ({solution.solution_type})...")
+            
+            if solution.solution_type == "coordinates":
+                # Імпорт тут, щоб уникнути циклічних імпортів
+                from utils.slider_solver import slider_solver 
+                
+                points = solution.data
+                if not points: 
+                    self.logger.error("❌ No coordinates received.")
+                    return False
+
+                # ---------------------------------------------------
+                # ВАРІАНТ 1: SLIDER (AliExpress)
+                # ---------------------------------------------------
+                if info.captcha_type == "slider":
+                    slider_btn = info.element_handle
+                    # Перестраховка: шукаємо кнопку, якщо хендл застарів
+                    if not slider_btn:
+                        slider_btn = await self.page.query_selector("#nc_1_n1z, .btn_slide, .slider-btn")
+                    
+                    if slider_btn:
+                        # Для слайдера нам потрібна тільки X координата першої точки
+                        # Але тут теж важливий масштаб!
+                        # Зазвичай API повертає дистанцію у фізичних пікселях.
+                        # Якщо слайдер "пролітає" занадто далеко - додайте ділення на DPR (див. нижче)
+                        x_offset = int(points[0]['x'])
+                        await slider_solver.slide(self.page, slider_btn, x_offset)
+                    else:
+                        self.logger.error("❌ Slider button not found.")
+
+                # ---------------------------------------------------
+                # ВАРІАНТ 2: CLICKS (Shein / Geetest / Icons)
+                # ---------------------------------------------------
+                else:
+                    self.logger.info(f"📍 Coordinates task for {self.marketplace}. Handling PIXELS & OFFSETS...")
+                    
+                    target_element = info.element_handle
+                    if not target_element:
+                        # Резервний пошук для Shein
+                        target_element = await self.page.query_selector(".geetest_window, .geetest_widget, .geetest_item_wrap")
+
+                    if target_element:
+                        # 1. ОТРИМУЄМО КОЕФІЦІЄНТ МАСШТАБУВАННЯ (DPR)
+                        # Це те, що ви просили не забути!
+                        dpr = await self.page.evaluate("window.devicePixelRatio")
+                        self.logger.info(f"🖥️ Device Pixel Ratio (DPR): {dpr}")
+
+                        # 2. Отримуємо позицію картинки на сторінці (CSS пікселі)
+                        box = await target_element.bounding_box()
+                        
+                        if box:
+                            offset_x = box['x']
+                            offset_y = box['y']
+                            width_css = box['width']
+                            
+                            self.logger.info(f"📐 CSS Box: X={offset_x}, Y={offset_y}, W={width_css}")
+                            
+                            # 3. МАТЕМАТИКА КЛІКУ
+                            for i, p in enumerate(points):
+                                api_x = float(p['x'])
+                                api_y = float(p['y'])
+
+                                # Логіка перевірки масштабу:
+                                # API зазвичай працює з картинкою, яку ми йому надіслали.
+                                # Якщо скріншот був зроблений з урахуванням DPR, він у DPR разів більший за CSS.
+                                # Тому координати від API треба поділити на DPR.
+                                
+                                # УВАГА: Якщо ви використовуєте стандартний screenshot() у Playwright,
+                                # він зберігає розмір як у CSS (автоматично даунскейлить), 
+                                # АБО як фізичні пікселі залежно від налаштувань.
+                                # Найкращий спосіб перевірити - просто поділити на DPR. 
+                                # Якщо API часто "маже", спробуйте прибрати ділення (scale_x = api_x).
+                                
+                                final_x = (api_x / dpr) + offset_x
+                                final_y = (api_y / dpr) + offset_y
+                                
+                                self.logger.info(f"🖱️ Click {i+1}: API({api_x},{api_y}) -> PAGE({final_x:.1f},{final_y:.1f})")
+                                
+                                await self.page.mouse.click(final_x, final_y)
+                                await asyncio.sleep(random.uniform(0.3, 0.6))
+                            
+                            # 4. ПІДТВЕРДЖЕННЯ (CONFIRM)
+                            # На Shein кнопка Confirm часто з'являється після кліків
+                            await asyncio.sleep(0.5)
+                            
+                            # Розширений пошук кнопки Confirm
+                            selectors = [
+                                "div[aria-label='Confirm']", 
+                                ".geetest_commit_tip", 
+                                ".geetest_commit", 
+                                ".geetest_submit",
+                                "text=Confirm",
+                                "text=confirm",
+                                "text=OK"
+                            ]
+                            
+                            confirm_btn = None
+                            
+                            # 1. Шукаємо в контексті елемента (якщо це контейнер)
+                            if info.element_handle:
+                                try:
+                                    confirm_btn = await info.element_handle.query_selector("text=Confirm")
+                                    if not confirm_btn:
+                                         confirm_btn = await info.element_handle.query_selector(".geetest_commit")
+                                except: pass
+                            
+                            # 2. Шукаємо на сторінці
+                            if not confirm_btn:
+                                for sel in selectors:
+                                    try:
+                                        confirm_btn = await self.page.query_selector(sel)
+                                        if confirm_btn and await confirm_btn.is_visible():
+                                            break
+                                        confirm_btn = None
+                                    except: continue
+
+                            # 3. Шукаємо у фреймах (якщо на сторінці нема)
+                            if not confirm_btn:
+                                for frame in self.page.frames:
+                                    for sel in selectors:
+                                        try:
+                                            # remove text= prefix for frame locator if needed, but query_selector supports it
+                                            btn = await frame.query_selector(sel)
+                                            if btn:
+                                                confirm_btn = btn
+                                                break
+                                        except: continue
+                                    if confirm_btn: break
+                            
+                            if confirm_btn:
+                                self.logger.info("✅ Found Confirm button, clicking...")
+                                await confirm_btn.click()
+                                await asyncio.sleep(1) # Wait for submission
+                            else:
+                                self.logger.warning("⚠️ Confirm button not found (auto-submitted?)")
+                                
+                        else:
+                            self.logger.error("❌ Could not get bounding box.")
+                    else:
+                        self.logger.error("❌ Target element for clicks lost.")
+                        
+            elif solution.solution_type == "token":
+                # Inject token
+                data = solution.data
+                if info.captcha_type == "geetest":
+                     await self.page.evaluate(f"""
+                        window.geetest_challenge = '{data.get("challenge", "")}';
+                        window.geetest_validate = '{data.get("validate", "")}';
+                        window.geetest_seccode = '{data.get("seccode", "")}';
+                    """)
+                elif info.captcha_type == "funcaptcha":
+                     await self.page.evaluate(f"document.getElementById('fc-token').value = '{data}';")
+                
+                elif info.captcha_type == "recaptcha_v2":
+                    # === ВИПРАВЛЕНА ЛОГІКА ДЛЯ IFRAME ===
+                    try:
+                        # JS скрипт, який ми будемо виконувати (всередині фрейму або на сторінці)
+                        injection_script = f"""(token) => {{
+                            console.log("Starting robust injection logic...");
+                            let tokenValue = '{data}';
+                            
+                            // 1. Fill textarea (Create if missing - vital for AliExpress)
+                            let el = document.getElementById("g-recaptcha-response");
+                            if (!el) el = document.querySelector('[name="g-recaptcha-response"]');
+                            if (!el) {{
+                                console.log("Creating missing g-recaptcha-response element...");
+                                el = document.createElement('textarea');
+                                el.id = 'g-recaptcha-response';
+                                el.name = 'g-recaptcha-response';
+                                el.style.display = 'none';
+                                document.body.appendChild(el);
+                            }}
+                            
+                            el.style.display = 'block';
+                            el.value = tokenValue;
+                            el.innerHTML = tokenValue;
+                            console.log("Token injected into textarea.");
+
+                            // 2. Callback execution
+                            let callbackCalled = false;
+                            
+                            // A. Check for 'clients' in global grecaptcha object (Power Move)
+                            try {{
+                                if (window.___grecaptcha_cfg && window.___grecaptcha_cfg.clients) {{
+                                    for (let i in window.___grecaptcha_cfg.clients) {{
+                                        let client = window.___grecaptcha_cfg.clients[i];
+                                        for (let key in client) {{
+                                            if (client[key] && client[key].callback) {{
+                                                    if (typeof client[key].callback === 'function') {{
+                                                        client[key].callback(tokenValue);
+                                                        callbackCalled = true;
+                                                        console.log("Called grecaptcha client callback via cfg");
+                                                    }}
+                                            }}
+                                        }}
+                                    }}
+                                }}
+                            }} catch(e) {{ console.error("Error checking grecaptcha cfg: " + e); }}
+
+                            // B. Data-callback attribute
+                            if (!callbackCalled) {{
+                                let widget = document.querySelector('.g-recaptcha, .recaptcha-checkbox, iframe[src*="recaptcha"]');
+                                if(widget) {{
+                                    let cbName = widget.getAttribute('data-callback');
+                                    if(!cbName) {{
+                                         let parent = widget.closest('.g-recaptcha');
+                                         if(parent) cbName = parent.getAttribute('data-callback');
+                                    }}
+                                    
+                                    if (cbName && typeof window[cbName] === 'function') {{
+                                        window[cbName](tokenValue);
+                                        callbackCalled = true;
+                                        console.log("Called data-callback: " + cbName);
+                                    }}
+                                }}
+                            }}
+
+                            // C. Fallback: Click buttons
+                            if (!callbackCalled) {{
+                                    console.log("No callback found. Trying submit buttons.");
+                                    let btn = document.querySelector('#recaptcha-demo-submit, #nc_1_n1z, [type="submit"], .btn_slide, .slider-btn');
+                                    if(btn) {{
+                                        btn.click();
+                                        console.log("Clicked fallback button");
+                                    }}
+                            }}
+                        }}"""
+
+                        # --- КРОК 1: Шукаємо Iframe (Специфічно для AliExpress) ---
+                        # Шукаємо фрейм, в URL якого є 'acs.aliexpress.com' або 'punish'
+                        captcha_frame_element = await self.page.query_selector("iframe[src*='acs.aliexpress.com'], iframe[src*='punish']")
+                        
+                        executed_in_frame = False
+                        if captcha_frame_element:
+                            self.logger.info("Found AliExpress Security Iframe. Injecting inside frame...")
+                            frame = await captcha_frame_element.content_frame()
+                            if frame:
+                                await frame.evaluate(injection_script, data)
+                                executed_in_frame = True
+                            else:
+                                self.logger.warning("Found iframe element but content_frame is None.")
+
+                        # --- КРОК 2: Якщо фрейм не знайшли або не спрацювало, пробуємо на головній ---
+                        if not executed_in_frame:
+                            self.logger.info("Injecting in Main Page context (Fallback)...")
+                            await self.page.evaluate(injection_script, data)
+
+                        self.logger.info("Executed reCAPTCHA solution script.")
+                    except Exception as e:
+                        self.logger.warning(f"Error executing reCAPTCHA script: {e}")
+            
+            elif solution.solution_type == "text":
+                # Text captcha (Amazon style)
+                text_solution = solution.data
+                # Amazon input field
+                input_field = self.page.locator("#captchacharacters")
+                if await input_field.is_visible():
+                    await input_field.fill(text_solution)
+                    await asyncio.sleep(0.5)
+                    # Click button
+                    await self.page.click("button.a-button-text")
+                    self.logger.info(f"Entered captcha text: {text_solution}")
+            
+            # 4. Wait and verify
+            await asyncio.sleep(5)
+            if await captcha_detector.quick_check(self.page, self.marketplace):
+                self.logger.error("❌ Captcha still present.")
+                return False
+                
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error solving captcha: {e}")
+            return False
 
 
     async def Maps(self, url: str):
@@ -77,7 +370,23 @@ class BaseParser(ABC):
             try:
                 self.logger.info(f"Navigating to {url} (Attempt {i+1})")
                 await self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                await asyncio.sleep(2) 
+                await asyncio.sleep(2)
+                
+                # Check for Immediate Block / Access Denied
+                title = await self.page.title()
+                content = await self.page.content()
+                
+                # Common Block Indicators
+                if "Access Denied" in title or "Access Denied" in content:
+                    self.logger.warning(f"🚫 PROXY BLOCKED: Access Denied on {url}")
+                    raise HardBanException("Access Denied - Proxy Blocked")
+                
+                # AliExpress Specific "Slider" on blank page (User Screenshot)
+                # Usually has title "Slider" or specific iframe
+                if "Slider" in title and "aliexpress" in url:
+                     self.logger.warning(f"🚫 PROXY BLOCKED: Slider Page on {url}")
+                     raise HardBanException("AliExpress Slider Block - Proxy Blocked")
+
                 return True
             except Exception as e:
                 self.logger.warning(f"Navigation failed: {e}")
@@ -114,4 +423,3 @@ class BaseParser(ABC):
         except Exception as e:
             self.logger.warning(f"Failed to click option '{text}': {e}")
             return False
-

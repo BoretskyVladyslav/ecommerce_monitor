@@ -1,18 +1,41 @@
 import re
 import random
 import json
+import sys
 import requests
 from pathlib import Path
 
 class ProxyManager:
     def __init__(self, proxy_file="proxies.txt"):
-        self.proxy_file = Path(proxy_file)
+        # 🔧 Визначаємо базову папку (де лежить .exe або main.py)
+        if getattr(sys, 'frozen', False):
+            # Якщо це .exe
+            base_dir = Path(sys.executable).parent
+        else:
+            # Якщо це Python скрипт
+            base_dir = Path(__file__).parent.parent  # utils/proxy_manager.py -> проект
+        
+        # Використовуємо абсолютний шлях
+        self.proxy_file = base_dir / proxy_file
+        print(f"📁 ProxyManager using: {self.proxy_file}")
+        
         self.proxies = []
         self.current_index = 0
         self.load_proxies()
+        
+        # Auto-download from URL if local file is empty
+        if not self.proxies:
+            from config.settings import settings
+            if settings.PROXY_URL:
+                print(f"🔄 Auto-updating proxies from URL: {settings.PROXY_URL}...")
+                self.update_from_url(settings.PROXY_URL)
+        
         # Randomize starting position so different sessions don't use same proxy
         if self.proxies:
             self.current_index = random.randint(0, len(self.proxies) - 1)
+            
+        # 🚫 Blacklist for current session
+        self.blacklisted_proxies = set()
 
     def get_next_proxy(self):
         if not self.proxies:
@@ -31,6 +54,7 @@ class ProxyManager:
         try:
             with open(self.proxy_file, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
+            print(f"📖 Read {len(lines)} lines from {self.proxy_file}")
         except Exception as e:
             print(f"⚠️ Error reading proxy file: {e}. System will run in DIRECT mode.")
             return
@@ -40,45 +64,112 @@ class ProxyManager:
         
         # Import settings for country filtering
         from config.settings import settings
-        allowed_countries = getattr(settings, 'PROXY_ALLOWED_COUNTRIES', [])
+        allowed_countries = [] # getattr(settings, 'PROXY_ALLOWED_COUNTRIES', []) -> DISABLED by user request
         
-        total_proxies = 0
-        filtered_proxies = 0
+        # --- Pre-parse to get IPs ---
+        parsed_configs = []
+        ips_to_check = set()
         
         for line in lines:
             line = line.strip()
             if not line or line.startswith('#'):
                 continue
-            
-            proxy_config = self._parse_proxy_line(line)
-            if proxy_config:
-                total_proxies += 1
-                
-                # Check country filter if enabled
+            config = self._parse_proxy_line(line)
+            if config:
+                parsed_configs.append(config)
                 if allowed_countries:
-                    ip = self._extract_ip(proxy_config['server'])
-                    country = self._get_country(ip, geo_cache)
-                    
-                    if country and country in allowed_countries:
-                        self.proxies.append(proxy_config)
-                        filtered_proxies += 1
+                    ip = self._extract_ip(config['server'])
+                    if ip and ip not in geo_cache:
+                        ips_to_check.add(ip)
+
+        # --- Batch Resolve Unknown IPs ---
+        if allowed_countries and ips_to_check:
+            print(f"🌍 Resolving {len(ips_to_check)} unknown proxy locations...")
+            unknown_ips_list = list(ips_to_check)
+            
+            # Batch size 100 (API limit)
+            batch_size = 100
+            for i in range(0, len(unknown_ips_list), batch_size):
+                batch = unknown_ips_list[i:i + batch_size]
+                try:
+                    # Using POST batch endpoint
+                    response = requests.post(
+                        "http://ip-api.com/batch?fields=query,countryCode", 
+                        json=batch, 
+                        timeout=10
+                    )
+                    if response.status_code == 200:
+                        results = response.json()
+                        for res in results:
+                            # res is dict like {'query': '1.2.3.4', 'countryCode': 'US'}
+                            q_ip = res.get('query')
+                            c_code = res.get('countryCode')
+                            if q_ip:
+                                geo_cache[q_ip] = c_code
                     else:
-                        # Skip this proxy
-                        pass
-                else:
-                    # No filter, add all
-                    self.proxies.append(proxy_config)
-        
-        # Save updated geo cache
+                        print(f"⚠️ Geo-API batch error: {response.status_code}")
+                except Exception as e:
+                    print(f"⚠️ Geo-API request failed: {e}")
+                
+        # Save updated geo cache (so we don't query again)
         self._save_geo_cache(geo_cache)
+        
+        # --- Filter ---
+        total_proxies = len(parsed_configs)
+        filtered_proxies = 0
+        
+        for config in parsed_configs:
+            if allowed_countries:
+                ip = self._extract_ip(config['server'])
+                # Look up in cache (now populated)
+                country = geo_cache.get(ip)
+                
+                if country and country in allowed_countries:
+                    self.proxies.append(config)
+                    filtered_proxies += 1
+                else:
+                    # Debug print for rejected (optional, can be noisy)
+                    # print(f"Skipping non-US proxy: {ip} ({country})")
+                    pass
+            else:
+                self.proxies.append(config)
+        
+        print(f"📊 Parsed: {total_proxies} proxies, Filtered (Valid US): {filtered_proxies}, Final: {len(self.proxies)}")
         
         if self.proxies:
             if allowed_countries:
-                print(f"✅ Loaded {len(self.proxies)} proxies from {total_proxies} (filtered for {', '.join(allowed_countries)})")
+                print(f"✅ Loaded {len(self.proxies)} proxies from {total_proxies} (verified {', '.join(allowed_countries)})")
             else:
                 print(f"✅ Loaded {len(self.proxies)} valid proxies from {self.proxy_file}")
         else:
-            print(f"ℹ️ No proxies found in {self.proxy_file}. System will run in DIRECT mode.")
+            if allowed_countries:
+                print(f"❌ 0 proxies matched the country filter {allowed_countries}!")
+            else:
+                print(f"ℹ️ No proxies found in {self.proxy_file}. System will run in DIRECT mode.")
+
+    def _get_country(self, ip, cache):
+        # Legacy method kept for compatibility if needed, but not used in new load_proxies
+        return cache.get(ip)
+
+    def _load_geo_cache(self):
+        """Load geo cache from file"""
+        cache_file = Path("proxy_geo_cache.json")
+        if cache_file.exists():
+            try:
+                with open(cache_file, 'r') as f:
+                    return json.load(f)
+            except:
+                pass
+        return {}
+
+    def _save_geo_cache(self, cache):
+        """Save geo cache to file"""
+        cache_file = Path("proxy_geo_cache.json")
+        try:
+            with open(cache_file, 'w') as f:
+                json.dump(cache, f, indent=2)
+        except:
+            pass
     
     def update_from_url(self, url):
         """Downloads proxies from URL and saves to file."""
@@ -87,7 +178,6 @@ class ProxyManager:
             response = requests.get(url, timeout=10)
             if response.status_code == 200:
                 content = response.text
-                # Simple validation: check if it looks like proxy list
                 if ":" in content:
                     with open(self.proxy_file, 'w', encoding='utf-8') as f:
                         f.write(content)
@@ -113,8 +203,6 @@ class ProxyManager:
             return False
 
     def _parse_proxy_line(self, line):
-        # Supports ip:port:user:pass or user:pass@ip:port
-        # Simple parser for ip:port:user:pass
         parts = line.split(':')
         if len(parts) == 4:
             return {
@@ -132,16 +220,29 @@ class ProxyManager:
             }
         return None
     
+    def blacklist_proxy(self, proxy):
+        """Marks a proxy as bad for this session."""
+        if not proxy: return
+        key = proxy.get('server')
+        if key:
+            self.blacklisted_proxies.add(key)
+            print(f"🚫 Proxy Blacklisted: {key} (Total Blacklisted: {len(self.blacklisted_proxies)})")
+
     def get_random_proxy(self):
         if not self.proxies:
             return None
-        return random.choice(self.proxies)
+        # Filter out blacklisted
+        available = [p for p in self.proxies if p.get('server') not in self.blacklisted_proxies]
+        if not available:
+            print("⚠️ All proxies blacklisted! Clearing blacklist to retry...")
+            self.blacklisted_proxies.clear()
+            available = self.proxies
+        return random.choice(available)
     
     def get_all_proxies(self):
         return self.proxies.copy()
     
     def _extract_ip(self, server_url):
-        """Extract IP from server URL like 'http://1.2.3.4:8080'"""
         try:
             # Remove protocol
             ip_port = server_url.split('://')[-1]
@@ -150,50 +251,7 @@ class ProxyManager:
             return ip
         except:
             return None
-    
-    def _get_country(self, ip, cache):
-        """Get country code for IP using cache or API"""
-        if not ip:
-            return None
-            
-        # Check cache first
-        if ip in cache:
-            return cache[ip]
-        
-        # Query API
-        try:
-            response = requests.get(f"http://ip-api.com/json/{ip}?fields=countryCode", timeout=3)
-            if response.status_code == 200:
-                data = response.json()
-                country = data.get('countryCode', None)
-                cache[ip] = country
-                return country
-        except Exception as e:
-            # Silently fail on API errors
-            pass
-        
-        return None
-    
-    def _load_geo_cache(self):
-        """Load geo cache from file"""
-        cache_file = Path("proxy_geo_cache.json")
-        if cache_file.exists():
-            try:
-                with open(cache_file, 'r') as f:
-                    return json.load(f)
-            except:
-                pass
-        return {}
-    
-    def _save_geo_cache(self, cache):
-        """Save geo cache to file"""
-        cache_file = Path("proxy_geo_cache.json")
-        try:
-            with open(cache_file, 'w') as f:
-                json.dump(cache, f, indent=2)
-        except:
-            pass
-    
+
     @property
     def proxy_count(self):
         return len(self.proxies)

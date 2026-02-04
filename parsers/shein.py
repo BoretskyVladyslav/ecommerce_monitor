@@ -3,48 +3,13 @@ from parsers.exceptions import SoftBanException, HardBanException
 import asyncio
 
 class SheinParser(BaseParser):
-    # Ban Detection Triggers (Stop-words)
-    BAN_TRIGGERS = [
-        "text='Risk Challenge'",
-        "text='Quick Security Check'",
-        "#captcha-box",
-        "iframe[src*='captcha']",
-        "text='Access Denied'",
-        "text='Something went wrong'",
-        "text='Verify you are human'"
-    ]
-    
+    # BAN_TRIGGERS removed - using CaptchaDetector in BaseParser
+
     async def check_for_ban(self):
         """
-        Checks if page shows captcha/ban indicators.
-        Raises SoftBanException if detected.
+        Alias for check_for_captcha (for backward compatibility).
         """
-        try:
-            for trigger in self.BAN_TRIGGERS:
-                # Check each trigger with short timeout
-                try:
-                    if trigger.startswith("text="):
-                        # Text-based check
-                        text_content = trigger.replace("text=", "").strip("'\"")
-                        locator = self.page.locator(f"text='{text_content}'")
-                    else:
-                        # Selector-based check
-                        locator = self.page.locator(trigger)
-                    
-                    # Quick check (100ms timeout)
-                    is_visible = await locator.is_visible(timeout=100)
-                    if is_visible:
-                        self.logger.warning(f"🚫 Shein Ban Detected: {trigger}")
-                        raise SoftBanException(f"Captcha/Ban detected: {trigger}")
-                except Exception as e:
-                    # If timeout or not found, continue checking other triggers
-                    if "SoftBanException" in str(type(e).__name__):
-                        raise e
-                    continue
-        except SoftBanException:
-            raise
-        except Exception as e:
-            self.logger.debug(f"Ban check error (non-critical): {e}")
+        await self.check_for_captcha()
     
     async def close_popups(self):
         """
@@ -83,18 +48,29 @@ class SheinParser(BaseParser):
         Includes ban detection and popup handling.
         """
         try:
+            self.logger.info("SHEIN PARSER LOADED V3 (Click-Fix)")
+            
             # Step 1: Check for ban/captcha FIRST (Shein-specific)
             await self.check_for_ban()
             
             # Step 1.1: Check for generic captchas (from BaseParser)
             await self.check_for_captcha()
             
-            # Step 1.5: Check if redirected to /risk/challenge (expired cookies)
+            # Step 1.5: Check if redirected to /risk/challenge
             current_url = self.page.url
             if "/risk/challenge" in current_url:
                 self.logger.warning(f"🚫 Shein Risk Challenge detected: {current_url}")
-                self.logger.warning("⚠️ Cookies expired! Run 'python scripts/warmup/generate_shein_cookies.py' to refresh.")
-                raise SoftBanException("Shein cookies expired - /risk/challenge redirect")
+                # Don't fail immediately - try to solve it first!
+                self.logger.info("⚔️ Attempting to solve Risk Challenge...")
+                
+                # Explicitly wait for the captcha container to load
+                try:
+                    self.logger.info("⏳ Waiting 10s for captcha logic to load...")
+                    await asyncio.sleep(10)
+                    # Force check immediately
+                    await self.check_for_captcha()
+                except Exception as e:
+                    self.logger.warning(f"Error in risk logic: {e}")
             
             # Step 2: Close any popups
             await self.close_popups()

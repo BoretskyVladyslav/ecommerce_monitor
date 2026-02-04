@@ -13,3 +13,4 @@ packaging
 Pillow
 requests
 playwright-stealth
+pyinstaller

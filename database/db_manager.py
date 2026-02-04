@@ -1,3 +1,5 @@
+import sys
+import os
 import asyncio
 import aiomysql
 import logging
@@ -15,6 +17,16 @@ class DatabaseManager:
         if cls._instance is None:
             cls._instance = super(DatabaseManager, cls).__new__(cls)
         return cls._instance
+    
+    def _get_resource_path(self, relative_path):
+        """ Get absolute path to resource, works for dev and for PyInstaller """
+        try:
+            # PyInstaller creates a temp folder and stores path in _MEIPASS
+            base_path = sys._MEIPASS
+        except Exception:
+            base_path = os.path.abspath(".")
+
+        return os.path.join(base_path, relative_path)
 
     async def get_pool(self) -> aiomysql.Pool:
         """Get or create the database connection pool."""
@@ -76,7 +88,16 @@ class DatabaseManager:
         async with pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 try:
-                    with open('database/schema.sql', 'r') as f:
+                    # Use absolute path resolving for PyInstaller compatibility
+                    schema_path = self._get_resource_path(os.path.join('database', 'schema.sql'))
+                    
+                    # Fallback: if not found in _MEIPASS, maybe it's local
+                    if not os.path.exists(schema_path):
+                         schema_path = os.path.abspath(os.path.join('database', 'schema.sql'))
+                    
+                    logger.info(f"Loading schema from: {schema_path}")
+                    
+                    with open(schema_path, 'r') as f:
                         schema = f.read()
                     
                     # Split by semi-colon to execute multiple statements
@@ -127,10 +148,11 @@ class DatabaseManager:
         """
         
         # КРОК 1: Отримуємо товари з НОВОЇ таблиці
+        # ЗМІНА: Видалено фільтр status = 1 — обробляємо ВСІ товари з URL
         products_query = """
             SELECT id, original_url, original_title 
             FROM products 
-            WHERE status = 1 AND original_url IS NOT NULL
+            WHERE original_url IS NOT NULL
         """
         logger.info(f"Executing Fetch Query: {products_query.strip()}") # LOG 1: SQL
         products = await self.fetch_all(products_query)
@@ -149,6 +171,9 @@ class DatabaseManager:
             p_id = p['id']
             url = p['original_url']
             title = p.get('original_title') or 'New Option'
+            # Truncate title to 255 chars to match DB column size
+            if title and len(title) > 255:
+                title = title[:255]
             
             # --- ЕТАП А: Задовольняємо батьківську таблицю (monitored_products) ---
             # Перевіряємо, чи є такий ID у старій таблиці

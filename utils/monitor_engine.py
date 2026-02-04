@@ -125,14 +125,14 @@ class MonitorEngine:
         
         # Оскільки в базі немає marketplace, визначаємо його для логів з URL
         marketplace = "unknown"
-        if "amazon" in url:
-            marketplace = "amazon"
+        # if "amazon" in url:
+        #     marketplace = "amazon"
         # if "temu" in url:
         #     marketplace = "temu"
         if "shein" in url:
             marketplace = "shein"
-        if "aliexpress" in url:
-            marketplace = "aliexpress"
+        # if "aliexpress" in url:
+        #     marketplace = "aliexpress"
         
         self.log(f"INFO: Processing Product ID: {option_id}, Market: {marketplace}") # LOG 4: Start Processing
 
@@ -172,9 +172,32 @@ class MonitorEngine:
                 if not os.path.exists(proxy_file):
                     # AUTO-CREATE: Якщо файлу немає - створюємо автоматично з випадковим proxy
                     self.log(f"⚠️ {marketplace.upper()} sticky proxy file not found: {proxy_file}")
-                    self.log(f"🤖 AUTO-CREATING sticky proxy file with random proxy...")
+                    create_new = True
+                else:
+                    try:
+                        with open(proxy_file, 'r') as f:
+                            sticky_data = json.load(f)
+                        
+                        # Check if this proxy is blacklisted
+                        if sticky_data['server'] in self.proxy_manager.blacklisted_proxies:
+                            self.log(f"🚫 Sticky proxy {sticky_data['server']} is BLACKLISTED. Rotating...")
+                            create_new = True
+                        else:
+                            proxy = {
+                                'server': sticky_data['server'],
+                                'username': sticky_data.get('username'),
+                                'password': sticky_data.get('password')
+                            }
+                            self.log(f"🔗 Using STICKY proxy for {marketplace}: {sticky_data['server']}")
+                            create_new = False
+                    except Exception as e:
+                        self.log(f"❌ Failed to load {marketplace} sticky proxy: {e}")
+                        create_new = True
+
+                if create_new:
+                    self.log(f"🤖 Assigning NEW sticky proxy...")
                     
-                    # Беремо випадковий proxy
+                    # Беремо випадковий proxy (blacklist-aware)
                     random_proxy = self.proxy_manager.get_random_proxy()
                     if random_proxy:
                         # Зберігаємо як sticky proxy
@@ -186,8 +209,7 @@ class MonitorEngine:
                         try:
                             with open(proxy_file, 'w') as f:
                                 json.dump(proxy_data, f, indent=2)
-                            self.log(f"✅ Created {proxy_file} with proxy: {random_proxy['server']}")
-                            self.log(f"💡 For better results, run: python scripts/warmup/generate_{marketplace}_cookies.py")
+                            self.log(f"✅ Updated {proxy_file} with: {random_proxy['server']}")
                             proxy = random_proxy
                         except Exception as create_err:
                             self.log(f"❌ Failed to create proxy file: {create_err}")
@@ -195,20 +217,6 @@ class MonitorEngine:
                     else:
                         self.log(f"❌ No proxies available!")
                         proxy = None
-                else:
-                    try:
-                        with open(proxy_file, 'r') as f:
-                            sticky_data = json.load(f)
-                        proxy = {
-                            'server': sticky_data['server'],
-                            'username': sticky_data.get('username'),
-                            'password': sticky_data.get('password')
-                        }
-                        self.log(f"🔗 Using STICKY proxy for {marketplace}: {sticky_data['server']}")
-                    except Exception as e:
-                        self.log(f"❌ Failed to load {marketplace} sticky proxy: {e}")
-                        self.log(f"⚠️ Falling back to RANDOM proxy")
-                        proxy = self.proxy_manager.get_random_proxy()
             else:
                 # Для інших маркетплейсів - випадковий проксі
                 proxy = self.proxy_manager.get_random_proxy()
@@ -263,11 +271,22 @@ class MonitorEngine:
                     use_mobile = marketplace == "temu"
                     
                     # Launch Browser with resource blocking
+                    # Enable images for marketplaces with visual captchas (AliExpress, Shein, Temu)
+                    should_block_images = True
+                    if marketplace in ["aliexpress", "shein", "temu"]:
+                        should_block_images = False
+                        self.log(f"🖼️ Images ENABLED for {marketplace} (required for captcha solving)")
+
+                    # Simplified mode for AliExpress (mimic user's script)
+                    is_simplified = marketplace == "aliexpress"
+
                     context, browser = await self.browser_manager.get_context(
                         p, 
                         session_data, 
                         block_resources=True,
-                        mobile_mode=use_mobile
+                        mobile_mode=use_mobile,
+                        block_images=should_block_images,
+                        simplified=is_simplified
                     )
                     
                     if use_mobile:
@@ -281,18 +300,53 @@ class MonitorEngine:
                         # Delay after opening tab
                         await asyncio.sleep(random.uniform(1, 2))
                         
-                        # Apply stealth to this page (critical for Shein/Temu)
-                        try:
+                        # 🌍 RUNTIME LOCATION CHECK (User Request)
+                        # Verify we are actually in US before proceeding
+                        if proxy:
                             try:
-                                from playwright_stealth import stealth_async
-                                await stealth_async(page)
-                            except ImportError:
-                                # playwright-stealth 2.0.1+
-                                from playwright_stealth import Stealth
-                                stealth = Stealth()
-                                await stealth.apply_stealth_async(page)
-                        except Exception as e:
-                            self.log(f"⚠️ Stealth warning: {e}")
+                                self.log("🌍 Verifying proxy location via ip-api.com...")
+                                # Fast check, strict timeout
+                                check_response = await page.goto("http://ip-api.com/json", wait_until='domcontentloaded', timeout=10000)
+                                if check_response:
+                                    # Parse JSON content from body pre element or just text
+                                    content = await page.content()
+                                    if "countryCode" in content:
+                                        # Simple string check or parse
+                                        import json
+                                        # content is html usually, let's get text
+                                        text = await page.evaluate("document.body.innerText")
+                                        try:
+                                            geo_data = json.loads(text)
+                                            country = geo_data.get('countryCode')
+                                            if country != 'US':
+                                                self.log(f"🚫 PROXY ERROR: Location is {country}, expected US. Rotating...")
+                                                raise HardBanException(f"Wrong Country: {country}")
+                                            else:
+                                                self.log(f"✅ Proxy Location Verified: {country}")
+                                        except json.JSONDecodeError:
+                                            pass # If unexpected format, skip check to be safe/lenient
+                                    else:
+                                        pass
+                            except HardBanException:
+                                raise # Propagate to rotate
+                            except Exception as e:
+                                self.log(f"⚠️ Location check warning: {e}")
+                                # Don't block flow if check fails, but log it
+                        
+                        # Apply stealth to this page (critical for Shein/Temu)
+                        # SKIP for simplified mode (AliExpress uses standard browser)
+                        if not is_simplified:
+                            try:
+                                try:
+                                    from playwright_stealth import stealth_async
+                                    await stealth_async(page)
+                                except ImportError:
+                                    # playwright-stealth 2.0.1+
+                                    from playwright_stealth import Stealth
+                                    stealth = Stealth()
+                                    await stealth.apply_stealth_async(page)
+                            except Exception as e:
+                                self.log(f"⚠️ Stealth warning: {e}")
 
                         # 2. БЛОК 2 & 3: Human Search Flow + Robust Selectors
                         if marketplace == "temu":
@@ -578,7 +632,28 @@ class MonitorEngine:
 
 
                     except HardBanException as e:
-                        self.log(f"HardBan for {option_id}. Retry.")
+                        self.log(f"🚫 HardBan (Block) for {option_id}: {e}")
+                        
+                        # BLACKLIST PROXY because we got blocked
+                        if session_data.get('proxy'):
+                             # We can blacklist by URL or by the object if we still have it
+                             # session_data['proxy'] is the URL string
+                             # ProxyManager expects logic to handle this.
+                             # But wait, ProxyManager.blacklist_proxy expects a dict usually? 
+                             # Let's check implementation. 
+                             # blacklist_proxy(self, proxy) -> checks proxy.get('server')
+                             # We used `proxy` variable earlier!
+                             if proxy:
+                                 self.log(f"💀 Blacklisting bad proxy: {proxy.get('server')}")
+                                 self.proxy_manager.blacklist_proxy(proxy)
+                             
+                        # Close browser
+                        try:
+                            await context.close()
+                            await browser.close()
+                        except: pass
+                        
+                        # Retry loop continues...
                         last_error = "HardBan"
                     except Exception as inner_e:
                         # self.log(f"Error checking {option_id}: {inner_e}")
