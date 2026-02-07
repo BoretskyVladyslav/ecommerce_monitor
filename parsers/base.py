@@ -20,74 +20,137 @@ class BaseParser(ABC):
             self.marketplace = "temu"
         else:
             self.marketplace = "unknown"
+            
+        # Session path for saving state
+        self.session_path = f"{self.marketplace}_session_state.json"
+
+    async def save_session(self):
+        """Saves values (cookies/storage) to the session file."""
+        if self.marketplace == "unknown": return
+
+        try:
+            await self.page.context.storage_state(path=self.session_path)
+            self.logger.info(f"💾 Session saved to {self.session_path}")
+        except Exception as e:
+            self.logger.warning(f"⚠️ Failed to save session: {e}")
 
     async def check_for_captcha(self):
         """
-        Checks for captchas using CaptchaDetector.
-        Attempts to solve if detected.
-        Raises SoftBanException if solve fails or hard ban detected.
+        🔥 WORK MODE: Immediately trigger warmup instead of solving in the main flow.
         """
-        # 1. Quick check (fastest)
         is_captcha = await captcha_detector.quick_check(self.page, self.marketplace)
         
         if is_captcha:
-            self.logger.warning(f"🚫 Captcha detected on {self.marketplace}!")
+            self.logger.warning(f"🚫 Captcha detected on {self.marketplace} during work process!")
             
-            # --- DEBUG: Introspect Recaptcha Widget ---
+            # --- DEBUG: Introspect Recaptcha Widget (optional but kept) ---
             try:
                 self.logger.info("🐞 DEBUG: Inspecting Recaptcha Widget...")
-                # Перевіряємо наявність фреймів для дебагу
                 frames = self.page.frames
-                self.logger.info(f"🐞 Found {len(frames)} frames.")
                 for f in frames:
                     if "acs.aliexpress" in f.url or "recaptcha" in f.url:
                         self.logger.info(f"🐞 Frame found: {f.url}")
-            except Exception as e:
-                self.logger.error(f"🐞 Debug inspection failed: {e}")
-            # --- END DEBUG ---
-
-            # 2. Try to solve
-            solved = await self.solve_captcha()
+            except: pass
             
-            if not solved:
-                 # If solve failed, raise SoftBan to rotate proxy
-                raise SoftBanException(f"Captcha detected and solve failed on {self.marketplace}")
-                
-            self.logger.info("✅ Captcha solved! Continuing...")
+            # --- FAIL FAST ---
+            # Raise SoftBan to trigger MonitorEngine's cookie deletion and warmup trigger
+            raise SoftBanException(f"Captcha detected on {self.marketplace} - Yielding to Warmup")
 
-    async def solve_captcha(self) -> bool:
+    async def wait_for_captcha_or_element(self, selector: str, timeout: int = 20) -> bool:
+        """
+        🔥 SMART WAIT: Waits for an element to appear, but periodically checks for captchas.
+        Returns True if element is found.
+        Raises SoftBanException if captcha is found.
+        Returns False if timeout reached.
+        """
+        start_time = asyncio.get_event_loop().time()
+        while asyncio.get_event_loop().time() - start_time < timeout:
+            # 1. Check for Captcha
+            is_captcha = await captcha_detector.quick_check(self.page, self.marketplace)
+            if is_captcha:
+                self.logger.warning(f"🚨 Captcha detected while waiting for {selector}!")
+                raise SoftBanException(f"Captcha detected on {self.marketplace} - Yielding to Warmup")
+            
+            # 2. Check for Element
+            try:
+                if await self.page.locator(selector).is_visible(timeout=1000): # Short timeout for element check
+                    return True
+            except:
+                pass
+                
+            # Wait a bit before next check
+            await asyncio.sleep(2)
+            
+        return False
+
+
+    async def solve_captcha(self, max_attempts: int = 5) -> bool:
         """
         Attempts to solve the detected captcha using CaptchaSolver and SliderSolver.
+        Includes retry logic for unstable captchas (UNSOLVABLE errors).
         """
-        try:
-            # 1. Full detection with screenshot
-            info = await captcha_detector.detect(self.page, self.marketplace, take_screenshot=True)
+        if self.marketplace.lower() == 'aliexpress':
+            self.logger.warning("🚫 Captcha solving disabled for AliExpress (per user request). Failing immediately.")
+            return False
+
+        for attempt in range(max_attempts):
+            self.logger.info(f"🧩 Captcha Solve Attempt {attempt + 1}/{max_attempts}")
             
-            if not info.detected:
-                self.logger.info("Captcha disappeared during detailed check.")
-                return True
+            try:
+                # 1. Full detection with screenshot
+                info = await captcha_detector.detect(self.page, self.marketplace, take_screenshot=True)
                 
-            self.logger.info(f"🧩 Solving {info.captcha_type}...")
-            
-            # 2. Get solution from API
-            solve_params = {"page_url": self.page.url}
-            if info.additional_data:
-                solve_params.update(info.additional_data)
+                if not info.detected:
+                    self.logger.info("✅ Captcha disappeared during detailed check.")
+                    return True
+                    
+                self.logger.info(f"🧩 Solving {info.captcha_type}...")
                 
-            solution = await captcha_solver.solve(
-                captcha_type=info.captcha_type,
-                image_path=info.screenshot_path,
-                additional_params=solve_params
-            )
-            
-            if not solution.solved:
-                self.logger.error("❌ Auto-solver failed to get solution.")
-                return False
+                # 2. Get solution from API
+                solve_params = {"page_url": self.page.url}
+                if info.additional_data:
+                    solve_params.update(info.additional_data)
+                    
+                solution = await captcha_solver.solve(
+                    captcha_type=info.captcha_type,
+                    image_path=info.screenshot_path,
+                    additional_params=solve_params
+                )
                 
-            # 3. Apply solution
-            self.logger.info(f"🛠️ Applying solution ({solution.solution_type})...")
-            
-            if solution.solution_type == "coordinates":
+                if not solution.solved:
+                    # Fix: solution.data contains error message if solved is False
+                    err_msg = str(solution.data) if solution.data else "Unknown error"
+                    
+                    if "UNSOLVABLE" in err_msg.upper():
+                        self.logger.warning("⚠️ Captcha marked UNSOLVABLE by API. Retrying with new screenshot...")
+                        await asyncio.sleep(2)
+                        continue 
+                    
+                    self.logger.error(f"❌ Auto-solver failed: {err_msg}")
+                    await asyncio.sleep(2)
+                    continue
+
+                # 3. Apply solution
+                self.logger.info(f"🛠️ Applying solution ({solution.solution_type})...")
+                
+                applied_success = await self._apply_solution(solution, info)
+                if applied_success:
+                    return True
+                else:
+                    self.logger.warning("⚠️ Failed to apply solution. Retrying...")
+                    await asyncio.sleep(2)
+                    continue
+
+            except Exception as e:
+                self.logger.error(f"⚠️ Error during solve attempt {attempt+1}: {e}")
+                await asyncio.sleep(2)
+        
+        self.logger.error("❌ Failed to solve captcha after all attempts.")
+        return False
+
+    async def _apply_solution(self, solution, info) -> bool:
+        """Helper to apply solution (extracted from original solve_captcha)"""
+        if solution.solution_type == "coordinates":
                 # Імпорт тут, щоб уникнути циклічних імпортів
                 from utils.slider_solver import slider_solver 
                 
@@ -176,6 +239,7 @@ class BaseParser(ABC):
                                 ".geetest_commit_tip", 
                                 ".geetest_commit", 
                                 ".geetest_submit",
+                                ".captcha_click_confirm", # User Recommendation
                                 "text=Confirm",
                                 "text=confirm",
                                 "text=OK"
@@ -221,12 +285,9 @@ class BaseParser(ABC):
                             else:
                                 self.logger.warning("⚠️ Confirm button not found (auto-submitted?)")
                                 
-                        else:
-                            self.logger.error("❌ Could not get bounding box.")
-                    else:
-                        self.logger.error("❌ Target element for clicks lost.")
-                        
-            elif solution.solution_type == "token":
+                # End of "coordinates" block
+        
+        elif solution.solution_type == "token":
                 # Inject token
                 data = solution.data
                 if info.captcha_type == "geetest":
@@ -336,17 +397,17 @@ class BaseParser(ABC):
                     except Exception as e:
                         self.logger.warning(f"Error executing reCAPTCHA script: {e}")
             
-            elif solution.solution_type == "text":
-                # Text captcha (Amazon style)
-                text_solution = solution.data
-                # Amazon input field
-                input_field = self.page.locator("#captchacharacters")
-                if await input_field.is_visible():
-                    await input_field.fill(text_solution)
-                    await asyncio.sleep(0.5)
-                    # Click button
-                    await self.page.click("button.a-button-text")
-                    self.logger.info(f"Entered captcha text: {text_solution}")
+        elif solution.solution_type == "text":
+            # Text captcha (Amazon style)
+            text_solution = solution.data
+            # Amazon input field
+            input_field = self.page.locator("#captchacharacters")
+            if await input_field.is_visible():
+                await input_field.fill(text_solution)
+                await asyncio.sleep(0.5)
+                # Click button
+                await self.page.click("button.a-button-text")
+                self.logger.info(f"Entered captcha text: {text_solution}")
             
             # 4. Wait and verify
             await asyncio.sleep(5)
@@ -355,10 +416,6 @@ class BaseParser(ABC):
                 return False
                 
             return True
-            
-        except Exception as e:
-            self.logger.error(f"Error solving captcha: {e}")
-            return False
 
 
     async def Maps(self, url: str):

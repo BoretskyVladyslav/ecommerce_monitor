@@ -160,6 +160,9 @@ class BrowserManager:
                 elif 'temu' in url and os.path.exists('temu_session_state.json'):
                     storage_state_file = 'temu_session_state.json'
                     self.log_debug("🔑 Using saved Temu session")
+                elif 'aliexpress' in url and os.path.exists('aliexpress_session_state.json'):
+                    storage_state_file = 'aliexpress_session_state.json'
+                    self.log_debug("🔑 Using saved AliExpress session")
         
         # Add storage_state to context args if available
         if storage_state_file:
@@ -174,8 +177,21 @@ class BrowserManager:
             try:
                 resource_type = route.request.resource_type
                 
+                # Dynamic Check: allow page-level override
+                # If page has 'image_blocking_enabled' attribute, use it. Otherwise use default 'block_images' arg.
+                page_instance = None
+                try:
+                    if route.request.frame:
+                        page_instance = route.request.frame.page
+                except: pass
+
+                effective_block_images = block_images
+                if page_instance:
+                    # Check for dynamic override (default to initial setting if not set)
+                    effective_block_images = getattr(page_instance, "image_blocking_enabled", block_images)
+
                 # Block images to save traffic (unless explicitly disabled)
-                if block_images and resource_type == "image":
+                if effective_block_images and resource_type == "image":
                     await route.abort()
                 # Block other heavy resources only if block_resources=True
                 # НЕ блокуємо stylesheet - він потрібен!

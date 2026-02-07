@@ -1,5 +1,7 @@
 import customtkinter as ctk
 from config.settings import settings
+import json
+import os
 
 class SettingsModal(ctk.CTkToplevel):
     def __init__(self, parent):
@@ -78,6 +80,24 @@ class SettingsModal(ctk.CTkToplevel):
         self.add_field("Min Delay (sec):", "delay_min", str(settings.DELAY_MIN))
         self.add_field("Max Delay (sec):", "delay_max", str(settings.DELAY_MAX))
 
+        # ==========================
+        # 4. CAPTCHA SETTINGS
+        # ==========================
+        ctk.CTkLabel(self.scroll, text="Captcha Settings (2Captcha)", font=("Arial", 14, "bold"), text_color="#3498db").pack(anchor="w", pady=(20, 5))
+        
+        # Load current key from file
+        self.captcha_config_path = os.path.join(os.getcwd(), 'config', 'captcha_config.json')
+        current_api_key = ""
+        try:
+            if os.path.exists(self.captcha_config_path):
+                with open(self.captcha_config_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    current_api_key = data.get('2captcha', {}).get('api_key', '')
+        except Exception as e:
+            print(f"Error loading captcha config: {e}")
+
+        self.add_field("API Key:", "captcha_key", current_api_key, is_password=False)
+
 
         # Save Button
         self.btn_save = ctk.CTkButton(self, text="Save Configuration", command=self.on_save, height=40, font=("Arial", 14, "bold"))
@@ -92,6 +112,22 @@ class SettingsModal(ctk.CTkToplevel):
         entry = ctk.CTkEntry(container, show="*" if is_password else "")
         entry.insert(0, str(default_val))
         entry.pack(side="left", fill="x", expand=True)
+        
+        # --- FIX: FORCE PASTE FOR NON-ENGLISH LAYOUTS ---
+        def force_paste(event):
+            try:
+                # Get text from clipboard
+                clipboard = self.clipboard_get()
+                # Insert at current cursor position
+                entry.insert("insert", clipboard)
+                return "break" # Prevent default behavior
+            except:
+                pass
+
+        # Bind Ctrl+V (and Control-v for completeness)
+        entry.bind("<Control-v>", force_paste)
+        entry.bind("<Control-V>", force_paste)
+        # ------------------------------------------------
         
         if not hasattr(self, 'fields'): self.fields = {}
         self.fields[key] = entry
@@ -114,6 +150,51 @@ class SettingsModal(ctk.CTkToplevel):
             settings.ENABLE_TEMU = self.var_enable_temu.get()
             settings.ENABLE_SHEIN = self.var_enable_shein.get()
             settings.ENABLE_ALIEXPRESS = self.var_enable_aliexpress.get()
+            
+            # --- Save Captcha Config ---
+            new_captcha_key = self.fields['captcha_key'].get()
+            try:
+                data = {}
+                # Try load existing to preserve other settings
+                if os.path.exists(self.captcha_config_path):
+                    try:
+                        with open(self.captcha_config_path, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                    except: pass # Start fresh if corrupt
+                
+                # Set Defaults if creating new or missing fields
+                if "service" not in data: data["service"] = "2captcha"
+                if "enabled" not in data: data["enabled"] = True
+                if "max_retries" not in data: data["max_retries"] = 3
+                
+                # Ensure 2captcha section exists
+                if "2captcha" not in data: 
+                    data["2captcha"] = {
+                        "api_url": "https://2captcha.com",
+                        "timeout_seconds": 120,
+                        "poll_interval_seconds": 5
+                    }
+                
+                # Update Key
+                data['2captcha']['api_key'] = new_captcha_key
+                
+                # Ensure Pricing defaults (optional but good for UI consistency)
+                if "pricing" not in data:
+                    data["pricing"] = {
+                        "2captcha_slider": 2.99,
+                        "2captcha_recaptcha": 2.99,
+                        "2captcha_geetest": 2.99
+                    }
+
+                # Ensure directory exists
+                os.makedirs(os.path.dirname(self.captcha_config_path), exist_ok=True)
+
+                with open(self.captcha_config_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=2)
+                print(f"✅ Updated/Created Captcha Config with Key")
+
+            except Exception as e:
+                 print(f"❌ Error saving captcha config: {e}")
             
             # Update MAX_CONCURRENT_BROWSERS to match THREADS for logic consistency
             settings.MAX_CONCURRENT_BROWSERS = settings.THREADS

@@ -84,8 +84,14 @@ class MainWindow(ctk.CTkFrame):
         self.rows = {} # option_id -> row_widgets (list)
 
         # --- B. System Log ---
-        self.log_label = ctk.CTkLabel(self.tab_monitor, text="System Log", anchor="w")
-        self.log_label.grid(row=2, column=0, sticky="w", padx=5, pady=(10,0))
+        self.log_container = ctk.CTkFrame(self.tab_monitor, fg_color="transparent")
+        self.log_container.grid(row=2, column=0, sticky="ew", padx=5, pady=(10,0))
+        
+        self.log_label = ctk.CTkLabel(self.log_container, text="System Log", anchor="w")
+        self.log_label.pack(side="left")
+        
+        self.btn_copy_log = ctk.CTkButton(self.log_container, text="Copy Logs", width=80, height=24, command=self.copy_logs)
+        self.btn_copy_log.pack(side="right")
         
         self.log_textbox = ctk.CTkTextbox(self.tab_monitor, height=150, state="disabled")
         self.log_textbox.grid(row=3, column=0, sticky="ew", padx=5, pady=5)
@@ -128,20 +134,22 @@ class MainWindow(ctk.CTkFrame):
 
     def _update_row(self, t_id, p_id, ip, status):
         """Internal method to update or create a row."""
-        # Use p_id (Product ID / Option ID) as key
-        key = str(p_id) 
+        # Use t_id (Thread ID / Worker ID) as key for fixed rows per thread
+        key = str(t_id) 
         
         color = "gray"
         if "Checking" in status: color = "orange"
         if "OK" in status: color = "green"
         if "Sold Out" in status: color = "red"
         if "Error" in status: color = "red"
+        if "In Stock" in status: color = "#2ecc71" # Bright green
 
         if key in self.rows:
             # Update existing status label (index 3)
             # Row Widgets: [t_id_lbl, p_id_lbl, ip_lbl, status_lbl]
             widgets = self.rows[key]
-            widgets[2].configure(text=ip) # Update IP just in case
+            widgets[1].configure(text=p_id) # Update Product ID
+            widgets[2].configure(text=ip)   # Update IP
             widgets[3].configure(text=status, text_color=color)
         else:
             # Create new
@@ -217,6 +225,28 @@ class MainWindow(ctk.CTkFrame):
             if self.engine.proxy_manager.save_manual_list(manual):
                 self.log("Manual list saved.")
                 
+                
         self.update_proxy_count()
+
+    def copy_logs(self):
+        """Copies all text from the log console to clipboard."""
+        try:
+            # Temporarily enable to read
+            self.log_textbox.configure(state="normal")
+            all_text = self.log_textbox.get("1.0", "end")
+            self.log_textbox.configure(state="disabled")
+            
+            # Clear and set clipboard
+            self.clipboard_clear()
+            self.clipboard_append(all_text)
+            self.update() # Required to finalize clipboard on Windows
+            
+            # Visual feedback
+            original_text = self.btn_copy_log.cget("text")
+            self.btn_copy_log.configure(text="Copied!")
+            self.after(2000, lambda: self.btn_copy_log.configure(text=original_text))
+            
+        except Exception as e:
+            self.log(f"Error copying logs: {e}")
 
 

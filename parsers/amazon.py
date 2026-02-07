@@ -1,4 +1,5 @@
 from parsers.base import BaseParser
+from parsers.exceptions import SoftBanException
 import asyncio
 
 class AmazonParser(BaseParser):
@@ -12,6 +13,14 @@ class AmazonParser(BaseParser):
         try:
             # 1. Check for Captcha / Soft Ban
             await self.check_for_captcha()
+            
+            # 1.1 Check for "Dogs of Amazon" (Soft Ban / 404 / 503)
+            # This indicates we need to rotate IP or retry
+            dog_title = await self.page.title()
+            if "Sorry! Something went wrong!" in dog_title or await self.page.locator("img[alt='Dogs of Amazon']").count() > 0:
+                self.logger.warning("🐶 Amazon 'Dog Page' detected (Soft Ban/Error). Triggering retry...")
+                raise SoftBanException("Amazon Dog Page detected")
+
 
             # 2. Check Availability
             # Amazon "Currently unavailable" selector

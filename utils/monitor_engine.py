@@ -9,6 +9,7 @@ from playwright.async_api import async_playwright
 from database.db_manager import DatabaseManager
 from utils.proxy_manager import ProxyManager
 from utils.browser import BrowserManager
+from utils.session_manager import SessionManager
 from utils.auto_warmup import auto_warmup
 from config.settings import settings
 from parsers.site_parsers import get_parser_for_url
@@ -22,6 +23,12 @@ class MonitorEngine:
         self.db = DatabaseManager()
         self.proxy_manager = ProxyManager()
         self.browser_manager = BrowserManager()
+        self.session_manager = SessionManager()
+        self.worker_ids = asyncio.Queue()
+        # Initialize worker IDs (1-based)
+        for i in range(1, settings.THREADS + 1):
+             self.worker_ids.put_nowait(i)
+
         self.update_callback = update_callback 
         self.log_callback = log_callback       
         self.tasks = []
@@ -88,19 +95,36 @@ class MonitorEngine:
                     await asyncio.sleep(5)
                     continue
 
-                # 3. Process Batch (LIMITED concurrently to settings.THREADS)
+                # 🔥 ENABLE SMART GROUPING (Optimization: 1 page load for N variants)
+                url_groups = {}
+                for task in tasks:
+                    url = task['url']
+                    if url not in url_groups:
+                        url_groups[url] = []
+                    url_groups[url].append(task)
+                
+                self.log(f"📦 Grouped into {len(url_groups)} unique URLs (was {len(tasks)} tasks)")
+
+                # 3. Process groups (LIMITED concurrency to settings.THREADS)
+                # RESET Worker IDs queue to match current settings
+                self.worker_ids = asyncio.Queue()
+                for i in range(1, settings.THREADS + 1):
+                    self.worker_ids.put_nowait(i)
+
                 semaphore = asyncio.Semaphore(settings.THREADS)
                 
-                async def process_with_limit(task):
+                async def process_group_with_limit(url, group_tasks):
                     async with semaphore:
-                        await self._process_task(task)
+                        worker_id = await self.worker_ids.get()
+                        try:
+                            await self._process_task_group(url, group_tasks, worker_id)
+                        finally:
+                            self.worker_ids.put_nowait(worker_id)
 
-                workers = [process_with_limit(t) for t in tasks]
+                workers = [process_group_with_limit(url, group) for url, group in url_groups.items()]
                 await asyncio.gather(*workers)
                 
-                # Wait before next cycle if needed, or if we want continuous scraping
-                # settings.DELAY_MIN is usually for inter-check delay. 
-                # Since we processed all tasks, we should wait a bit.
+                # Wait before next cycle
                 self.log(f"Batch finished. Waiting {settings.DELAY_MIN}s...")
                 await asyncio.sleep(settings.DELAY_MIN)
 
@@ -125,14 +149,14 @@ class MonitorEngine:
         
         # Оскільки в базі немає marketplace, визначаємо його для логів з URL
         marketplace = "unknown"
-        # if "amazon" in url:
-        #     marketplace = "amazon"
+        if "amazon" in url:
+            marketplace = "amazon"
         # if "temu" in url:
         #     marketplace = "temu"
         if "shein" in url:
             marketplace = "shein"
-        # if "aliexpress" in url:
-        #     marketplace = "aliexpress"
+        if "aliexpress" in url:
+            marketplace = "aliexpress"
         
         self.log(f"INFO: Processing Product ID: {option_id}, Market: {marketplace}") # LOG 4: Start Processing
 
@@ -143,7 +167,7 @@ class MonitorEngine:
              return
         
         # Increased retries for Smart Retrier (Proxy Brute-Force)
-        max_retries = 10 if marketplace in ["shein", "temu"] else 3
+        max_retries = 10  # UPDATED per User Request: "if cookies don't pass more than 10 times"
         attempt = 0
         success = False
         status_code = 0 # Default Sold Out / Error
@@ -156,21 +180,46 @@ class MonitorEngine:
         while attempt < max_retries and self.running:
             attempt += 1
             
-            # БЛОК 1: STICKY PROXY для Temu (ОБОВ'ЯЗКОВО!)
-            # Якщо це Temu - ОБОВ'ЯЗКОВО використовувати прив'язаний проксі
+            # 1. STICKY PROXY & SESSION CHECK
             if marketplace in ["temu", "shein", "aliexpress"]:
                 import json
                 import os
-                # Для кожної платформи свій файл
+                
+                # Files mapping
                 proxy_files = {
                     'temu': 'temu_session_proxy.json',
                     'shein': 'shein_session_proxy.json',
                     'aliexpress': 'aliexpress_session_proxy.json'
                 }
-                proxy_file = proxy_files[marketplace]
+                session_files = {
+                    'temu': 'temu_session_state.json',
+                    'shein': 'shein_session_state.json',
+                    'aliexpress': 'aliexpress_session_state.json'
+                }
                 
+                proxy_file = proxy_files[marketplace]
+                session_file = session_files[marketplace]
+                
+                # 🔥 CRITICAL: Check if we have a valid session (cookies)
+                # User request: "If we don't have cookies, maybe make them?" -> Force Warmup
+                if not os.path.exists(session_file):
+                    self.log(f"⚠️ Missing session cookies for {marketplace}. forcing Auto-Warmup to create them...")
+                    try:
+                        # Force warmup logic to generate session
+                        await auto_warmup.handle_captcha(marketplace, force=True)
+                        self.log(f"⏳ Waiting for warmup to generate session...")
+                        await asyncio.sleep(10) # Give it a moment to sync file system
+                        
+                        if not os.path.exists(session_file):
+                             self.log(f"❌ Warmup failed to create session file. Will try naked request.")
+                        else:
+                             self.log(f"✅ Session created successfully! Proceeding.")
+                             # Reload potentially new proxy file if warmup rotated it
+                    except Exception as e:
+                        self.log(f"❌ Error during forced session creation: {e}")
+
                 if not os.path.exists(proxy_file):
-                    # AUTO-CREATE: Якщо файлу немає - створюємо автоматично з випадковим proxy
+                    # AUTO-CREATE: If file missing - create with random proxy
                     self.log(f"⚠️ {marketplace.upper()} sticky proxy file not found: {proxy_file}")
                     create_new = True
                 else:
@@ -193,14 +242,18 @@ class MonitorEngine:
                     except Exception as e:
                         self.log(f"❌ Failed to load {marketplace} sticky proxy: {e}")
                         create_new = True
-
+                
+                # Check again if we need to rotate (e.g. if forced warmup happened, we might want to ensure we use the NEW proxy)
+                # If warmup ran, it likely updated the proxy file. So we should re-read it or rely on the next loop?
+                # Actually, if warmup ran, we should probably RESTART the loop logic to pick up the new proxy cleanly.
+                if not os.path.exists(proxy_file):
+                     create_new = True 
+                     
                 if create_new:
                     self.log(f"🤖 Assigning NEW sticky proxy...")
                     
-                    # Беремо випадковий proxy (blacklist-aware)
                     random_proxy = self.proxy_manager.get_random_proxy()
                     if random_proxy:
-                        # Зберігаємо як sticky proxy
                         proxy_data = {
                             'server': random_proxy['server'],
                             'username': random_proxy.get('username'),
@@ -271,11 +324,17 @@ class MonitorEngine:
                     use_mobile = marketplace == "temu"
                     
                     # Launch Browser with resource blocking
-                    # Enable images for marketplaces with visual captchas (AliExpress, Shein, Temu)
+                    # Enable images for marketplaces with visual captchas (AliExpress, Temu)
+                    # Shein: User requested to BLOCK images during work (Step 1412)
+                    # Enable images for marketplaces with visual captchas (Temu)
+                    # AliExpress: User requested to BLOCK images (Performance Mode)
                     should_block_images = True
-                    if marketplace in ["aliexpress", "shein", "temu"]:
+                    if marketplace == "temu":
                         should_block_images = False
                         self.log(f"🖼️ Images ENABLED for {marketplace} (required for captcha solving)")
+                    else:
+                        should_block_images = True
+                        self.log(f"🚫 Images BLOCKED for {marketplace} (Performance Mode)")
 
                     # Simplified mode for AliExpress (mimic user's script)
                     is_simplified = marketplace == "aliexpress"
@@ -299,39 +358,6 @@ class MonitorEngine:
                         
                         # Delay after opening tab
                         await asyncio.sleep(random.uniform(1, 2))
-                        
-                        # 🌍 RUNTIME LOCATION CHECK (User Request)
-                        # Verify we are actually in US before proceeding
-                        if proxy:
-                            try:
-                                self.log("🌍 Verifying proxy location via ip-api.com...")
-                                # Fast check, strict timeout
-                                check_response = await page.goto("http://ip-api.com/json", wait_until='domcontentloaded', timeout=10000)
-                                if check_response:
-                                    # Parse JSON content from body pre element or just text
-                                    content = await page.content()
-                                    if "countryCode" in content:
-                                        # Simple string check or parse
-                                        import json
-                                        # content is html usually, let's get text
-                                        text = await page.evaluate("document.body.innerText")
-                                        try:
-                                            geo_data = json.loads(text)
-                                            country = geo_data.get('countryCode')
-                                            if country != 'US':
-                                                self.log(f"🚫 PROXY ERROR: Location is {country}, expected US. Rotating...")
-                                                raise HardBanException(f"Wrong Country: {country}")
-                                            else:
-                                                self.log(f"✅ Proxy Location Verified: {country}")
-                                        except json.JSONDecodeError:
-                                            pass # If unexpected format, skip check to be safe/lenient
-                                    else:
-                                        pass
-                            except HardBanException:
-                                raise # Propagate to rotate
-                            except Exception as e:
-                                self.log(f"⚠️ Location check warning: {e}")
-                                # Don't block flow if check fails, but log it
                         
                         # Apply stealth to this page (critical for Shein/Temu)
                         # SKIP for simplified mode (AliExpress uses standard browser)
@@ -562,12 +588,32 @@ class MonitorEngine:
                             # Парсер просто парсить поточну сторінку, original_url для логів
                             result = await parser.parse(original_url=url)
                         else:
-                            result = await parser.parse()
+                            # Pass target variants if available (Shein smart matching)
+                            target_color = task.get('target_color')
+                            target_size = task.get('target_size')
+                            
+                            # Check if parser accepts arguments to avoid TypeError
+                            if target_color or target_size:
+                                try:
+                                    result = await parser.parse(target_color=target_color, target_size=target_size)
+                                except TypeError:
+                                    # Fallback for parsers that haven't been updated yet
+                                    self.log(f"⚠️ Parser {type(parser).__name__} does not support variant args. Using default parse.")
+                                    result = await parser.parse()
+                            else:
+                                result = await parser.parse()
                         
                         # If we got here, success
                         status_code = result
                         status_text = "In Stock" if status_code == 1 else "Sold Out"
                         success = True
+                        
+                        # 🔥 SAVE SESSION ("Appetite" Save Point)
+                        # Save cookies/storage after successful navigation
+                        try:
+                            await parser.save_session()
+                        except Exception as save_e:
+                            self.log(f"⚠️ Failed to save final session: {save_e}")
                         
                         # Extra delay for Temu to avoid rate limiting
                         if marketplace == "temu":
@@ -584,6 +630,18 @@ class MonitorEngine:
                         self.log(f"🚫 SoftBan/Captcha for {option_id}: {e}")
                         last_error = f"Captcha: {e}"
                         
+                        # 🔥 AMAZON EXCEPTION: FORCE ROTATION, NO WARMUP
+                        if marketplace == 'amazon':
+                            self.log(f"🔄 Amazon SoftBan detected. Skipping warmup, forcing PROXY ROTATION...")
+                            # Clean cleanup
+                            try:
+                                await context.close()
+                                await browser.close()
+                            except: pass
+                            
+                            # Just 'continue' will hit the loop again, picking a NEW proxy (since Amazon doesn't use sticky session file)
+                            continue
+
                         # 🔥 ВИКОНУЄМО ВИМОГУ КОРИСТУВАЧА: "ЗРАЗУ ЗАКРИВАЄМО І АВТОАВАРМ UP"
                         # Вважаємо будь-яку SoftBan помилку сигналом для негайного Warmup
                         self.log(f"🚨 CAPTCHA DETECTED! Stopping attempts and forcing Auto-Warmup...")
@@ -594,11 +652,16 @@ class MonitorEngine:
                                 marketplace, 
                                 force=True  # ⚠️ FORCE: User wants immediate action regardless of history
                             )
+
                             
                             if warmup_triggered:
                                 self.log(f"✅ Auto-warmup initiated for {marketplace}")
                                 self.log(f"⏳ Waiting 90s for warmup to complete...")
                                 await asyncio.sleep(90) # Чекаємо поки скрипт відпрацює
+                                self.log(f"🔄 Restarting task with fresh session/cookies...")
+                                attempt = 0 
+                                continue
+                                
                             else:
                                 self.log(f"❌ Auto-warmup failed to start (check logs). Cooling down 60s...")
                                 await asyncio.sleep(60)
@@ -677,19 +740,34 @@ class MonitorEngine:
         # Identify if we failed completely
         if not success:
             status_text = f"Fail: {last_error}" if last_error else "Failed"
-            # Do NOT update status to 0 if it was failure to connect? 
-            # User req: "Якщо після 3 спроб невдача -> Пише помилку в лог, але не змінює статус товару"
-            # So we only update DB if success is True, OR if we result in clear "Sold Out" (which is success=True with result=0)
-            # Wait, if parse() returns 0 (Sold Out), success is True.
-            # If exception, success is False.
             
+            # 🔥 USER REQ: "If cookies don't pass more than 10 times, change everything"
+            # We reached max_retries (10), so we Nuke the session/proxy to force rotation.
+            if marketplace in ["shein", "temu", "aliexpress"]:
+                self.log(f"⚠️ Failed {max_retries} times for {marketplace}. Nuking session & proxy to force UPDATE.")
+                
+                files_to_delete = []
+                # Session files
+                if marketplace == 'shein': files_to_delete.extend(['shein_session_state.json', 'shein_session_proxy.json'])
+                elif marketplace == 'aliexpress': files_to_delete.extend(['aliexpress_session_state.json', 'aliexpress_session_proxy.json'])
+                elif marketplace == 'temu': files_to_delete.extend(['temu_session_state.json', 'temu_session_proxy.json'])
+                
+                for f_name in files_to_delete:
+                    if os.path.exists(f_name):
+                        try:
+                            os.remove(f_name)
+                            self.log(f"   🗑️ Deleted {f_name}")
+                        except Exception as del_err:
+                            self.log(f"   ❌ Failed to delete {f_name}: {del_err}")
+
             self.log(f"Failed to check {option_id} after {max_retries} attempts.")
             await self.db.add_log_entry(option_id, 0, -1, -1, f"Check Failed: {last_error}")
             self.update_gui(str(option_id), str(option_id), "Failed", "Error")
 
         else:
             # Success (either In Stock or Sold Out found)
-            await self.db.update_product_option_status(option_id, status_code)
+            table_to_update = task.get('table', 'monitored_product_options')
+            await self.db.update_product_option_status(option_id, status_code, table=table_to_update)
             self.log(f"INFO: Updated status for ID {option_id} to '{status_text}' ({status_code})") # LOG 6: Success Update
             
             # We should probably fetch old status to log changes, but for now log result
@@ -699,6 +777,368 @@ class MonitorEngine:
             await self.db.add_log_entry(option_id, 0, -1, status_code, log_msg)
             
             self.update_gui(str(option_id), str(option_id), proxy_ip, status_text)
+
+    async def _process_task_group(self, url: str, group_tasks: List[Dict], worker_id: int):
+        """
+        🔥 CRITICAL OPTIMIZATION: Process multiple variants of the same product in ONE browser session.
+        This prevents the "machine gun" effect where 10 size variants = 10 browser launches.
+        
+        Args:
+            url: The product URL
+            group_tasks: Tasks list
+            worker_id: The ID of the worker/thread (for sticky sessions)
+        """
+        if not self.running or not group_tasks:
+            return
+        
+        # Intelligent delay
+        start_delay = random.uniform(settings.DELAY_MIN, settings.DELAY_MAX)
+        await asyncio.sleep(start_delay)
+        
+        # Extract marketplace from URL
+        marketplace = "unknown"
+        if "shein" in url.lower():
+            marketplace = "shein"
+        elif "aliexpress" in url.lower():
+            marketplace = "aliexpress"
+        elif "temu" in url.lower():
+            marketplace = "temu"
+        elif "amazon" in url.lower():
+            marketplace = "amazon"
+        
+        self.log(f"📦 Processing GROUP: {len(group_tasks)} variants on {marketplace} ({url[:50]}...) [Worker {worker_id}]")
+        
+        if marketplace == "unknown":
+            self.log(f"⚠️ Unknown marketplace for URL: {url}. Skipping group.")
+            return
+        
+        import json
+        import os
+
+        # 1. Get Sticky Proxy File for this Thread
+        proxy_file = self.session_manager.get_thread_proxy_path(marketplace, worker_id)
+        
+        # Load proxy if exists
+        proxy = None
+        proxy_data = None
+        
+        if os.path.exists(proxy_file):
+            try:
+                with open(proxy_file, 'r') as f:
+                    proxy_data = json.load(f)
+                proxy = {
+                    'server': proxy_data['server'],
+                    'username': proxy_data.get('username'),
+                    'password': proxy_data.get('password')
+                }
+                self.log(f"🔗 [Worker {worker_id}] Using sticky proxy: {proxy['server']}")
+            except Exception as e:
+                self.log(f"❌ [Worker {worker_id}] Failed to load proxy: {e}")
+        
+        # If no sticky proxy, get new random one
+        if not proxy:
+            proxy = self.proxy_manager.get_random_proxy()
+            if not proxy:
+                self.log(f"❌ [Worker {worker_id}] No proxies available. Skipping group.")
+                return
+            # Save as sticky for next time
+            proxy_data = {
+                'server': proxy['server'],
+                'username': proxy.get('username'),
+                'password': proxy.get('password')
+            }
+            try:
+                with open(proxy_file, 'w') as f:
+                    json.dump(proxy_data, f, indent=2)
+            except: pass
+
+        # 2. Get Session File unique to this Proxy
+        session_file = self.session_manager.get_session_path(marketplace, proxy_data)
+        
+        # Ensure session exists (warmup if needed)
+        if not os.path.exists(session_file):
+            self.log(f"⚠️ [Worker {worker_id}] Missing session {os.path.basename(session_file)}. Forcing warmup...")
+            try:
+                await auto_warmup.handle_captcha(
+                    marketplace, 
+                    force=True, 
+                    proxy_data=proxy_data, 
+                    session_file=session_file
+                )
+                await asyncio.sleep(10)
+            except Exception as e:
+                self.log(f"❌ Warmup failed: {e}")
+
+        
+        # Try to process the group with retry logic
+        max_retries = 3
+        attempt = 0
+        
+        while attempt < max_retries and self.running:
+            attempt += 1
+            self.log(f"🔄 Group attempt {attempt}/{max_retries}")
+            
+            try:
+                # Launch browser ONCE for the entire group
+                async with async_playwright() as p:
+                    # Prepare session data
+                    proxy_url = None
+                    if proxy:
+                        if proxy.get('username') and proxy.get('password'):
+                            try:
+                                scheme, rest = proxy['server'].split("://", 1)
+                                proxy_url = f"{scheme}://{proxy['username']}:{proxy['password']}@{rest}"
+                            except ValueError:
+                                proxy_url = proxy['server']
+                        else:
+                            proxy_url = proxy['server']
+                    
+                    session_data = {
+                        "proxy": proxy_url,
+                        "user_agent": None,
+                        "url": url,
+                        "storage_state": session_file  # Pass the unique session file
+                    }
+                    
+                    # Determine mobile mode and image blocking
+                    use_mobile = marketplace == "temu"
+                    
+                    # 🔥 ENABLE IMAGES FOR SHEIN to fix broken captchas/white window
+                    # Also helps with stealth as real users load images
+                    should_block_images = marketplace not in ["temu", "shein", "aliexpress"] 
+                    
+                    is_simplified = marketplace == "aliexpress"
+                    
+                    # Create browser context
+                    context, browser = await self.browser_manager.get_context(
+                        p,
+                        session_data,
+                        block_resources=True,
+                        mobile_mode=use_mobile,
+                        block_images=should_block_images,
+                        simplified=is_simplified
+                    )
+                    
+                    page = await context.new_page()
+                    
+                    try:
+                        # Navigate to URL ONCE
+                        self.log(f"🌐 Loading {url[:60]}...")
+                        
+                        # Special handling for Temu (search-based)
+                        if marketplace == "temu":
+                            from parsers.site_parsers import get_parser_for_url
+                            parser = get_parser_for_url(url, page)
+                            await parser.Maps(url)
+                        else:
+                            await page.goto(url, timeout=60000, wait_until='domcontentloaded')
+                        
+                        # Wait for page to settle
+                        await asyncio.sleep(random.uniform(settings.DELAY_MIN, settings.DELAY_MAX))
+                        
+                        # Get parser
+                        from parsers.site_parsers import get_parser_for_url
+                        parser = get_parser_for_url(url, page)
+                        # 3. ПАРСИНГ: SMART BATCH PROCESSING
+                        
+                        # Set of option_ids that have been successfully updated in this batch
+                        updated_option_ids = set()
+                        
+                        # --- ATTLEMPT 1: BULK UPDATE via JSON-LD (Fastest) ---
+                        try:
+                            if hasattr(parser, 'get_availability_from_json_ld'):
+                                self.log("🚀 Attempting BULK update via JSON-LD...")
+                                variant_matrix = await parser.get_availability_from_json_ld()
+                                
+                                if variant_matrix:
+                                    self.log(f"✅ JSON-LD Matrix found with {len(variant_matrix)} variants.")
+                                    
+                                    # Check each task against the matrix
+                                    for task in group_tasks:
+                                        t_color = task.get('target_color')
+                                        t_size = task.get('target_size')
+                                        opt_id = task['option_id']
+                                        
+                                        # Find status in matrix
+                                        status = None
+                                        
+                                        # Try exact match first
+                                        if (t_color, t_size) in variant_matrix:
+                                            status = variant_matrix[(t_color, t_size)]
+                                        else:
+                                            # Fuzzy match
+                                            for (c, s), st in variant_matrix.items():
+                                                c_match = t_color and c.lower().strip() == t_color.lower().strip() if t_color else True
+                                                
+                                                if t_size:
+                                                    s_item = s.lower().strip()
+                                                    s_target = t_size.lower().strip()
+                                                    # Strict match for short sizes
+                                                    if len(s_target) <= 3 or len(s_item) <= 3:
+                                                        s_match = s_item == s_target
+                                                    else:
+                                                        s_match = s_item == s_target or s_target in s_item
+                                                else:
+                                                    s_match = True
+
+                                                if c_match and s_match:
+                                                    status = st
+                                                    break
+                                        
+                                        if status is not None:
+                                            # Update DB immediately
+                                            status_text = "In Stock" if status == 0 else "Sold Out"
+                                            await self.db.update_product_option_status(opt_id, status, table="product_options")
+                                            self.log(f"   ✅ Bulk updated {opt_id} ({t_color}/{t_size}): {status_text}")
+                                            self.update_gui(str(worker_id), str(opt_id), "Bulk JSON", status_text)
+                                            updated_option_ids.add(opt_id)
+
+                        except Exception as json_e:
+                            self.log(f"⚠️ Bulk JSON-LD update failed (continuing to individual): {json_e}")
+
+                        # --- ATTEMPT 2: INDIVIDUAL PROCESSING (Fallback for missing/complex items) ---
+                        remaining_tasks = [t for t in group_tasks if t['option_id'] not in updated_option_ids]
+                        
+                        if remaining_tasks:
+                            if updated_option_ids:
+                                self.log(f"📋 Falling back to individual check for {len(remaining_tasks)} remaining items...")
+                            else:
+                                self.log(f"📋 JSON-LD failed/empty. Checking {len(remaining_tasks)} items individually...")
+
+                            # 🐢 STRATEGY B: SMART DOM FALLBACK (One Click -> All Sizes)
+                            dom_matrix_success = False
+                            
+                            # Try to get DOM matrix if we have a target color
+                            target_color = remaining_tasks[0].get('target_color')
+                            
+                            if hasattr(parser, 'get_dom_matrix') and target_color:
+                                self.log(f"📋 JSON-LD incomplete. Switching to SMART DOM scan for color '{target_color}'...")
+                                dom_matrix = await parser.get_dom_matrix(target_color)
+                                
+                                if dom_matrix:
+                                    self.log(f"✅ DOM Matrix success! Updating group...")
+                                    dom_matrix_success = True
+                                    
+                                    for task in remaining_tasks:
+                                        t_color = task.get('target_color')
+                                        t_size = task.get('target_size')
+                                        opt_id = task['option_id']
+                                        
+                                        # Default to OOS (2) if not found
+                                        status = 2
+                                        
+                                        # Strict matching in DOM matrix
+                                        if (t_color, t_size) in dom_matrix:
+                                            status = dom_matrix[(t_color, t_size)]
+                                        else:
+                                            # Fuzzy size match specifically for this color key
+                                            for (k_color, k_size), k_status in dom_matrix.items():
+                                                if k_color != t_color: continue
+                                                
+                                                # Size matching
+                                                if t_size and k_size:
+                                                    if t_size.lower() == k_size.lower():
+                                                        status = k_status
+                                                        break
+                                        
+                                        status_text = "In Stock" if status == 0 else "Sold Out"
+                                        await self.db.update_product_option_status(opt_id, status, table="product_options")
+                                        self.log(f"   ✓ (DOM) {t_color}/{t_size} -> {status_text}")
+                                        self.update_gui(str(worker_id), str(opt_id), "DOM Matrix", status_text)
+
+                            if not dom_matrix_success:
+                                self.log(f"⚠️ DOM Matrix failed/skipped. Checking {len(remaining_tasks)} items individually...")
+                                
+                                for i, task in enumerate(remaining_tasks):
+                                    option_id = task['option_id']
+                                    target_color = task.get('target_color')
+                                    target_size = task.get('target_size')
+                                    
+                                    self.log(f"   [{i+1}/{len(remaining_tasks)}] Processing {target_color}/{target_size}...")
+                                    self.update_gui(str(worker_id), str(option_id), proxy_url, "Checking...")
+                                    
+                                    # Call Parse with specific target
+                                    try:
+                                        if target_color or target_size:
+                                            result = await parser.parse(target_color=target_color, target_size=target_size)
+                                        else:
+                                            result = await parser.parse()
+                                            
+                                        status_code = result
+                                        status_text = "In Stock" if status_code == 0 else "Sold Out"
+                                        
+                                        await self.db.update_product_option_status(option_id, status_code, table="product_options")
+                                        self.log(f"   ✅ Updated {option_id}: {status_text}")
+                                        self.update_gui(str(worker_id), str(option_id), proxy_url, status_text)
+                                        
+                                        # Human delay between variants
+                                        if i < len(remaining_tasks) - 1:
+                                            await asyncio.sleep(random.uniform(2, 5))
+                                            
+                                    except SoftBanException:
+                                        # 🔥 RE-RAISE so the outer loop catches it and triggers Warmup!
+                                        raise
+                                    except HardBanException:
+                                        raise
+                                    except Exception as e:
+                                        self.log(f"   ❌ Failed {option_id}: {e}")
+                                        self.update_gui(str(worker_id), str(option_id), proxy_url, "Error")
+
+                        # 🔥 SAVE SESSION
+                        try:
+                            await parser.save_session()
+                        except: pass
+                        
+                        # Close browser
+                        await context.close()
+                        await browser.close()
+                        
+                        self.log(f"✅ Group processed successfully")
+                        return  # Success!
+                        
+                    except SoftBanException as e:
+                        self.log(f"🚫 SoftBan/Captcha detected: {e}")
+                        await context.close()
+                        await browser.close()
+                        
+                        # 🔥 KILL COOKIES IMMEDIATELY (as requested by user)
+                        try:
+                            if session_file and os.path.exists(session_file):
+                                os.remove(session_file)
+                                self.log(f"🗑️ Deleted compromised session file: {session_file}")
+                        except: pass
+                        
+                        # 🔥 TRIGGER WARMUP with fresh start
+                        try:
+                            self.log(f"🔥 Starting Warmup for {marketplace}...")
+                            self.log(f"🔥 Starting Warmup for {marketplace}...")
+                            await auto_warmup.handle_captcha(
+                                marketplace, 
+                                force=True,
+                                proxy_data=proxy_data,
+                                session_file=session_file
+                            )
+                            self.log(f"✅ Warmup finished. Waiting 60s before retry...")
+                            await asyncio.sleep(60)
+                        except Exception as warmup_err:
+                            self.log(f"❌ Warmup failed: {warmup_err}")
+                        
+                        continue  # Retry with fresh cookies (or no cookies)
+                        
+                    except Exception as e:
+                        self.log(f"❌ Error processing group: {e}")
+                        try:
+                            await context.close()
+                            await browser.close()
+                        except:
+                            pass
+                        continue  # Retry
+                        
+            except Exception as e:
+                self.log(f"❌ Fatal error in group processing: {e}")
+                break
+        
+        self.log(f"❌ Failed to process group after {max_retries} attempts")
 
 
     def update_settings(self):

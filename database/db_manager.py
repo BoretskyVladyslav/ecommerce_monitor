@@ -141,100 +141,133 @@ class DatabaseManager:
 
     async def fetch_active_products(self) -> List[Dict[str, Any]]:
         """
-        1. Беремо товари з нової таблиці products.
-        2. Перевіряємо, чи існують вони в СТАРІЙ батьківській таблиці (monitored_products).
-        3. Якщо ні — створюємо їх там (легально, звичайним INSERT).
-        4. Створюємо запис у monitored_product_options.
+        Fetches active tasks. Prioritizes specific variants from `product_options`.
+        Wrapper logic:
+        1. Get products from `products` table.
+        2. For each product, check `product_options` (variants).
+        3. If variants exist -> Create tasks for each variant (updating `product_options` table).
+        4. If NO variants -> Fallback to `monitored_product_options` (legacy/single item).
         """
         
-        # КРОК 1: Отримуємо товари з НОВОЇ таблиці
-        # ЗМІНА: Видалено фільтр status = 1 — обробляємо ВСІ товари з URL
+        # 1. Get products
         products_query = """
             SELECT id, original_url, original_title 
             FROM products 
             WHERE original_url IS NOT NULL
         """
-        logger.info(f"Executing Fetch Query: {products_query.strip()}") # LOG 1: SQL
+        logger.info(f"Fetch Query: {products_query.strip()}")
         products = await self.fetch_all(products_query)
         
         if not products:
              logger.info("No active products found in DB.")
              return []
         
-        logger.info(f"Fetch Found: {len(products)} products.") # LOG 2: Count 
-
-
         tasks = []
 
-        # КРОК 2: Обробляємо кожен товар окремо
         for p in products:
             p_id = p['id']
             url = p['original_url']
             title = p.get('original_title') or 'New Option'
-            # Truncate title to 255 chars to match DB column size
-            if title and len(title) > 255:
-                title = title[:255]
+            if title and len(title) > 255: title = title[:255]
             
-            # --- ЕТАП А: Задовольняємо батьківську таблицю (monitored_products) ---
-            # Перевіряємо, чи є такий ID у старій таблиці
-            check_parent_query = "SELECT id, marketplace FROM monitored_products WHERE id = %s"
-            parent_exists = await self.fetch_one(check_parent_query, (p_id,))
-            
+            # Determine marketplace
             marketplace = "unknown"
-            if parent_exists:
-                 marketplace = parent_exists.get("marketplace", "unknown")
-            else:
-                # Визначаємо маркетплейс для старої таблиці (вона цього вимагає)
-                if "amazon" in url: marketplace = "amazon"
-                elif "ebay" in url: marketplace = "ebay"
-                elif "temu" in url: marketplace = "temu"
-                elif "shein" in url: marketplace = "shein"
-                elif "aliexpress" in url: marketplace = "aliexpress"
+            if "amazon" in url: marketplace = "amazon"
+            elif "ebay" in url: marketplace = "ebay"
+            elif "temu" in url: marketplace = "temu"
+            elif "shein" in url: marketplace = "shein"
+            elif "aliexpress" in url: marketplace = "aliexpress"
 
-                # Вставляємо запис у monitored_products, щоб заспокоїти Foreign Key
-                logger.info(f"Syncing parent table for ID {p_id}...")
-                insert_parent_query = """
-                    INSERT INTO monitored_products (id, original_url, marketplace, status)
-                    VALUES (%s, %s, %s, 1)
-                """
-                # Ми примусово вставляємо той самий ID
-                await self.execute(insert_parent_query, (p_id, url, marketplace))
-
-            # --- ЕТАП Б: Тепер безпечно працюємо з monitored_product_options ---
-            # Перевіряємо, чи є запис опції
-            check_option_query = "SELECT id FROM monitored_product_options WHERE product_id = %s"
-            option_exists = await self.fetch_one(check_option_query, (p_id,))
+            # --- CHECK FOR VARIANTS IN product_options ---
+            # This is the PRIMARY source for Shein/Variants
+            variants_query = """
+                SELECT id, option_name_1, option_name_2, url 
+                FROM product_options 
+                WHERE product_id = %s
+            """
+            variants = await self.fetch_all(variants_query, (p_id,))
             
-            mpo_id = None
-            if option_exists:
-                mpo_id = option_exists['id']
+            if variants:
+                # OPTION A: Product has specific variants defined
+                for v in variants:
+                    # Use variant-specific URL if available, else product URL
+                    variant_url = v.get('url') if v.get('url') else url
+                    
+                    tasks.append({
+                        "option_id": v['id'],             # ID from product_options
+                        "url": variant_url,
+                        "product_id": p_id,
+                        "marketplace": marketplace,
+                        "target_color": v.get('option_name_1'), # For Parser
+                        "target_size": v.get('option_name_2'),  # For Parser
+                        "table": "product_options"        # Signal to update THIS table
+                    })
             else:
-                # Тепер цей INSERT пройде без помилки 1452, бо батько існує!
-                logger.info(f"Creating monitor option for ID {p_id}...")
-                insert_option_query = """
-                    INSERT INTO monitored_product_options (product_id, option_name, status)
-                    VALUES (%s, %s, 1)
-                """
-                mpo_id = await self.execute(insert_option_query, (p_id, title))
-            
-            tasks.append({
-                "option_id": mpo_id,
-                "url": url,
-                "product_id": p_id,
-                "marketplace": marketplace 
-            })
-            
-        marketplaces_found = [t['marketplace'] for t in tasks]
-        logger.info(f"Marketplaces in batch: {list(set(marketplaces_found))}") # LOG 3: Marketplaces list
+                # OPTION B: No variants, use LEGACY monitored_product_options
+                # -----------------------------------------------------------
+                
+                # Sync parent monitored_products entry (Legacy req)
+                check_parent = "SELECT id FROM monitored_products WHERE id = %s"
+                if not await self.fetch_one(check_parent, (p_id,)):
+                    await self.execute(
+                        "INSERT INTO monitored_products (id, original_url, marketplace, status) VALUES (%s, %s, %s, 1)",
+                        (p_id, url, marketplace)
+                    )
+
+                # Get/Create option in monitored_product_options
+                check_option = "SELECT id FROM monitored_product_options WHERE product_id = %s"
+                opt = await self.fetch_one(check_option, (p_id,))
+                
+                mpo_id = None
+                if opt:
+                    mpo_id = opt['id']
+                else:
+                    mpo_id = await self.execute(
+                        "INSERT INTO monitored_product_options (product_id, option_name, status) VALUES (%s, %s, 1)",
+                        (p_id, title)
+                    )
+                
+                tasks.append({
+                    "option_id": mpo_id,                  # ID from monitored_product_options
+                    "url": url,
+                    "product_id": p_id,
+                    "marketplace": marketplace,
+                    "target_color": None,
+                    "target_size": None,
+                    "table": "monitored_product_options"  # Legacy table
+                })
+        
+        logger.info(f"Generated {len(tasks)} tasks.")
         return tasks
 
-    async def update_product_option_status(self, option_id: int, status: int):
-        """Updates status for a monitored product option (1=In Stock, 0=Sold Out)."""
-        query = """
-            UPDATE monitored_product_options 
-            SET status = %s, updated_at = NOW()
-            WHERE id = %s
+    async def update_product_option_status(self, option_id: int, status: int, table: str = "monitored_product_options"):
         """
+        Updates status for a monitored option (1=In Stock, 0=Sold Out).
+        Args:
+            option_id: ID of the record
+            status: New status
+            table: 'product_options' or 'monitored_product_options' (legacy)
+        """
+        if table == "product_options":
+            # For variants table, we don't have updated_at in all schemas, 
+            # but usually good practice. If schema doesn't have it, SQL will ignore or optional?
+            # User schema showed `created_at` but NOT `updated_at` for product_options in Step 90 output!
+            # So I will NOT try to set updated_at for product_options to be safe, or check schema repeatedly.
+            # Step 90 output: product_options structure: id, product_id, option_name_1/2, url, type, prices, status, created_at.
+            # NO updated_at column in product_options.
+            query = """
+                UPDATE product_options 
+                SET status = %s
+                WHERE id = %s
+            """
+        else:
+            # Legacy table has updated_at
+            query = """
+                UPDATE monitored_product_options 
+                SET status = %s, updated_at = NOW()
+                WHERE id = %s
+            """
+            
         await self.execute(query, (status, option_id))
 
     async def add_log_entry(self, option_id: int, session_id: int, old_status: int, new_status: int, note: str):

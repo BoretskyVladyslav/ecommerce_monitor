@@ -140,12 +140,18 @@ class CaptchaDetector:
                 "text='Select all images'",
             ],
             "click_points": [
-                ".geetest_item_wrap",
+                # Click Points (Graphic Selection)
                 "text=Please select the following graphics in order",
                 "text=Click in order",
-                ".geetest_widget",
+                "div:has-text('Please select the following graphics')", # Partial text match
                 "div[class*='geetest']",
-                "text=Confirm",
+                ".geetest_panel_box",  
+                ".pic_wrapper",
+                
+                # Confirm button often appears with this - adding partial text match
+                "div:has-text('Confirm')",
+                "div[aria-label='Confirm']",
+                ".geetest_commit",
             ],
             "generic": [
                 "#captcha-box",
@@ -154,6 +160,7 @@ class CaptchaDetector:
                 "text='Quick Security Check'",
                 "text='Verify you are human'",
                 ".verify-code-container",
+                "text=Confirm",  # Catch-all for stray confirm buttons
             ]
         },
         "temu": {
@@ -419,10 +426,12 @@ class CaptchaDetector:
                 else:
                     locator = page.locator(selector)
                 
+                
                 # Швидка перевірка на головній сторінці
-                is_visible = await locator.is_visible(timeout=500)
+                is_visible = await locator.is_visible(timeout=2000) # Increased timeout for reliability
                 
                 if is_visible:
+                    logger.debug(f"   MATCH (Main): {selector}")
                     element = await locator.first.element_handle()
                     
                     # FIX: If we found "Confirm" button, get the parent widget
@@ -464,8 +473,11 @@ class CaptchaDetector:
                 
                 # --- IFRAME SCANNING ---
                 # Якщо на головній не знайшли, шукаємо у всіх фреймах
-                for frame in page.frames:
+                for i, frame in enumerate(page.frames):
                     try:
+                        # Skip detached frames
+                        if frame.is_detached(): continue
+                        
                         frame_locator = None
                         if selector.startswith("text="):
                              text_content = selector.replace("text=", "").strip("'\"")
@@ -507,13 +519,16 @@ class CaptchaDetector:
                                  except Exception as e:
                                      logger.warning(f"⚠️ Failed to find parent for confirm button in iframe: {e}")
                                      
-                             logger.info(f"🚫 Captcha detected in IFRAME! Url: {frame.url}, Type: {captcha_type}")
+                                     
+                             logger.info(f"🚫 Captcha detected in IFRAME ({frame.url})! Type: {captcha_type}, Selector: {selector}")
                              return (selector, element, captcha_type)
-                    except:
+                    except Exception as frame_err:
+                        # logger.debug(f"   Frame check error: {frame_err}")
                         continue
                         
-            except Exception:
+            except Exception as e:
                 # Timeout або елемент не знайдено - продовжуємо
+                # logger.debug(f"   Check failed for {selector}: {e}")
                 continue
         
         return None
