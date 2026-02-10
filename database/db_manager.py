@@ -33,36 +33,51 @@ class DatabaseManager:
         try:
             current_loop = asyncio.get_running_loop()
         except RuntimeError:
-            current_loop = None
-            
-        # Check if we need to create a new pool
-        need_new_pool = (
-            self._pool is None or
-            current_loop is None or
-            (hasattr(self._pool, '_loop') and self._pool._loop != current_loop) or
-            (hasattr(self._pool, '_loop') and self._pool._loop.is_closed())
-        )
+            raise RuntimeError("No running event loop")
+
+        # Handle Lock per Loop to avoid "Future attached to different loop" errors
+        if not hasattr(self, '_locks'):
+            self._locks = {}
         
+        if current_loop not in self._locks:
+            self._locks[current_loop] = asyncio.Lock()
+        
+        loop_lock = self._locks[current_loop]
+
+        # Check if we need to create a new pool
+        need_new_pool = False
+        if self._pool is None:
+            need_new_pool = True
+        elif self._pool._loop != current_loop:
+            need_new_pool = True
+        elif self._pool.closed: # Check if pool is closed
+             need_new_pool = True
+
         if need_new_pool:
-            async with self._lock:
-                # Double-check after acquiring lock
-                try:
-                    current_loop = asyncio.get_running_loop()
-                except RuntimeError:
-                    raise RuntimeError("No running event loop")
-                    
+            async with loop_lock:
+                # Double-check
                 if (self._pool is None or 
                     self._pool._loop != current_loop or 
-                    self._pool._loop.is_closed()):
+                    self._pool.closed):
                     
-                    # Close old pool if exists
-                    if self._pool and not self._pool._loop.is_closed():
-                        try:
-                            self._pool.close()
-                            await self._pool.wait_closed()
-                        except:
-                            pass
-                    
+                    # Handle old pool cleanup SAFELY
+                    if self._pool:
+                        if self._pool._loop != current_loop:
+                            # ⚠️ Different loop! Cannot await wait_closed()
+                            # Just close and forget.
+                            try:
+                                self._pool.close()
+                                logger.info("Closed old database pool (from different loop)")
+                            except: pass
+                            self._pool = None
+                        elif not self._pool.closed:
+                            # Same loop, clean close
+                            try:
+                                self._pool.close()
+                                await self._pool.wait_closed()
+                            except: pass
+                            self._pool = None
+
                     try:
                         self._pool = await aiomysql.create_pool(
                             host=settings.DB_HOST,
@@ -80,6 +95,7 @@ class DatabaseManager:
                     except Exception as e:
                         logger.error(f"Failed to create database pool: {e}")
                         raise
+        
         return self._pool
 
     async def init_db(self):
@@ -154,6 +170,7 @@ class DatabaseManager:
             SELECT id, original_url, original_title 
             FROM products 
             WHERE original_url IS NOT NULL
+            ORDER BY id ASC
         """
         logger.info(f"Fetch Query: {products_query.strip()}")
         products = await self.fetch_all(products_query)
@@ -197,6 +214,7 @@ class DatabaseManager:
                         "option_id": v['id'],             # ID from product_options
                         "url": variant_url,
                         "product_id": p_id,
+                        "product_title": title,           # Added Title
                         "marketplace": marketplace,
                         "target_color": v.get('option_name_1'), # For Parser
                         "target_size": v.get('option_name_2'),  # For Parser
@@ -231,6 +249,7 @@ class DatabaseManager:
                     "option_id": mpo_id,                  # ID from monitored_product_options
                     "url": url,
                     "product_id": p_id,
+                    "product_title": title,               # Added Title
                     "marketplace": marketplace,
                     "target_color": None,
                     "target_size": None,

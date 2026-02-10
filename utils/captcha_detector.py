@@ -546,17 +546,17 @@ class CaptchaDetector:
         selector, element, captcha_type = detection_result
         screenshot_path = None
         
-        # Smart wait for Shein captchas to fully render
+        # Smart wait for Shein captchas to fully render (але БЕЗ ДОВГИХ ЗАТРИМОК!)
         if take_screenshot and platform.lower() == "shein":
             try:
-                logger.info("⏳ Waiting for Shein captcha to load (network idle)...")
-                await page.wait_for_load_state("networkidle", timeout=30000)
-                logger.info("⏳ Safety sleep (50s) because we really want it to load...")
-                await asyncio.sleep(50)
+                # Короткий networkidle (капча оновлюється кожні 20-30s!)
+                await page.wait_for_load_state("networkidle", timeout=10000)
+                # Мінімальна пауза для рендерингу
+                await asyncio.sleep(2)
             except Exception as e:
                 logger.warning(f"⚠️ Network idle timeout (proceeding anyway): {e}")
                 # Failsafe: minimum wait even if networkidle times out
-                await asyncio.sleep(3)
+                await asyncio.sleep(2)
         
         # Робимо скріншот якщо потрібно
         if take_screenshot:

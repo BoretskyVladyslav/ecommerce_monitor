@@ -162,9 +162,10 @@ class SettingsModal(ctk.CTkToplevel):
                             data = json.load(f)
                     except: pass # Start fresh if corrupt
                 
-                # Set Defaults if creating new or missing fields
-                if "service" not in data: data["service"] = "2captcha"
-                if "enabled" not in data: data["enabled"] = True
+                
+                # Завжди встановлюємо 2captcha як сервіс і автоматично вмикаємо якщо є ключ
+                data["service"] = "2captcha"
+                data["enabled"] = True
                 if "max_retries" not in data: data["max_retries"] = 3
                 
                 # Ensure 2captcha section exists

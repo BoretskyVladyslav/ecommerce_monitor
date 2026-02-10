@@ -35,34 +35,18 @@ class AutoWarmup:
     MIN_TIME_BETWEEN_WARMUPS = 600    # Мінімум 10 хвилин між warmup (зменшено)
     
     # Warmup URLs
+    # Warmup URLs - SIMPLIFIED (Homepage only for Random Walker)
     WARMUP_URLS = {
         'shein': {
-            'target': "https://us.shein.com/pdsearch/Wonka",
+            'target': "https://us.shein.com/",
             'cookie_file': "shein_session_state.json",
             'proxy_file': "shein_session_proxy.json",
-            'warmup_products': [
-                "https://us.shein.com/SHEIN-Frenchy-Letter-Graphic-Tee-p-22673044.html",
-                "https://us.shein.com/Women-T-Shirts-c-1738.html",
-                "https://us.shein.com/Women-Dresses-c-1727.html",
-                "https://us.shein.com/Women-Pants-c-1740.html",
-                "https://us.shein.com/Women-Sweaters-c-1734.html",
-                "https://us.shein.com/Women-Shoes-c-1750.html",
-                "https://us.shein.com/Women-Accessories-c-1765.html",
-                "https://us.shein.com/Home-Living-c-2030.html",
-                "https://us.shein.com/Beauty-Health-c-1936.html"
-            ]
+            # We don't need entry_points anymore, we will find them dynamically
         },
         'aliexpress': {
-            'target': "https://www.aliexpress.com/w/wholesale-phone-cases.html",
+            'target': "https://www.aliexpress.com/",
             'cookie_file': "aliexpress_session_state.json",
             'proxy_file': "aliexpress_session_proxy.json",
-            'warmup_products': [
-                "https://www.aliexpress.com/item/1005001234567890.html",
-                "https://www.aliexpress.com/category/200003482/women-clothing.html",
-                "https://www.aliexpress.com/category/202001292/shoes.html",
-                "https://www.aliexpress.com/w/wholesale-phone-cases.html",
-                "https://www.aliexpress.com/w/wholesale-watches.html"
-            ]
         }
     }
     
@@ -338,8 +322,37 @@ class AutoWarmup:
             return
 
         try:
-            # Selectors found via MCP and common ones
+            # --- 1. HANDLE COOKIES (High Priority) ---
+            # The modal in your screenshot: "Aceptar Todo" / "Accept All"
+            cookie_selectors = [
+                "button:has-text('Aceptar Todo')",  # Spanish (from your screenshot)
+                "button:has-text('Accept All')",    # English
+                "button:has-text('Agree')",
+                "#onetrust-accept-btn-handler",     # Common ID for OneTrust banners
+                ".onetrust-accept-btn-handler"
+            ]
+            
+            for sel in cookie_selectors:
+                try:
+                    btn = page.locator(sel).first
+                    if await btn.is_visible():
+                        logger.info(f"   🍪 Accepting Cookies: {sel}")
+                        await btn.click()
+                        await asyncio.sleep(1)
+                        break # Found and clicked, stop looking for cookies
+                except: pass
+
+            # --- 2. HANDLE MARKETING POPUPS (Existing logic) ---
             close_selectors = [
+                # NEW: Special Deals / Collect All Popup
+                "div.wrapper-close",       # Often cross on banners
+                "i.iconfont-close",        # Standard Shein cross
+                "button.close-btn",
+                
+                # Text-based (if cross not found)
+                "text=No thanks",
+                "text=Not now",
+                
                 # New MCP findings
                 ".dialog-header-v2__close-btn", 
                 ".popup-dialog-couponPackage .close-btn",
@@ -347,8 +360,6 @@ class AutoWarmup:
                 # Standard findings
                 ".c-coupon-box .iconfont-close",
                 ".she-modal .iconfont-close",
-                "i.iconfont-close",
-                "button.close-btn",
                 "div[class*='close-btn']",
                 "[aria-label='Close']"
             ]
@@ -365,10 +376,13 @@ class AutoWarmup:
         except Exception as e:
             logger.warning(f"Error closing popups: {e}")
 
-    async def check_and_solve_captcha(self, page: Page, marketplace: str) -> bool:
+    async def check_and_solve_captcha(self, page: Page, marketplace: str, context: str = "unknown") -> bool:
 
         """
         Перевіряє наявність капчі та намагається її вирішити (Retry Loop).
+        
+        Args:
+            context: Контекст перевірки - "entry" (блокуюча) або "browsing" (rate-limit)
         """
         max_attempts = 5
         
@@ -379,8 +393,10 @@ class AutoWarmup:
         if not is_risk_url and not await captcha_detector.quick_check(page, marketplace):
             return True
         
-        settings.HEADLESS = True # Force visible for debug if needed
-        logger.warning(f"🛑 CAPTCHA DETECTED! Enabling images for solving...")
+        
+        settings.HEADLESS = False # Force visible for debug if needed
+        logger.warning(f"🛑 CAPTCHA DETECTED ({context})! Enabling images for solving...")
+        
         
         # 🔥 DYNAMIC IMAGE TOGGLE (User Request)
         # Enable images for this page to allow captcha to render
@@ -388,10 +404,8 @@ class AutoWarmup:
             page.image_blocking_enabled = False
             logger.info("   🖼️ Images temporarily ENABLED for captcha")
             
-            # Reload to load the captcha images
-            logger.info("   🔄 Reloading page to render captcha...")
-            await page.reload(timeout=30000, wait_until='domcontentloaded')
-            await asyncio.sleep(5)
+            # Даємо час капчі завантажитися без reload (reload викликає більше капч!)
+            await asyncio.sleep(3)
             
         except Exception as e:
             logger.warning(f"Error toggling images/reload: {e}")
@@ -422,12 +436,15 @@ class AutoWarmup:
                 )
                 
                 if not solution.solved:
-                    if "UNSOLVABLE" in str(solution.error) or "unsolvable" in str(solution.error):
+                    # Безпечна перевірка атрибуту error
+                    error_msg = getattr(solution, 'error', 'Unknown error')
+                    
+                    if "UNSOLVABLE" in str(error_msg) or "unsolvable" in str(error_msg):
                          logger.warning("⚠️ API Error: UNSOLVABLE. Retrying with fresh screenshot...")
                          await asyncio.sleep(2)
                          continue
                     
-                    logger.error(f"❌ Failed to solve captcha via API: {solution.error}")
+                    logger.error(f"❌ Failed to solve captcha via API: {error_msg}")
                     await asyncio.sleep(2)
                     continue
                 
@@ -569,19 +586,45 @@ class AutoWarmup:
                             if (input) input.value = '{data}';
                         """)
                     
-                # Чекаємо результату
-                await asyncio.sleep(5)
                 
-                # Перевіряємо чи зникла капча
-                if await captcha_detector.quick_check(page, marketplace):
+                # SMART WAIT: Чекаємо поки капча зникне (GeeTest потребує часу на анімацію!)
+                captcha_disappeared = False
+                for wait_attempt in range(15):  # max 15 seconds
+                    await asyncio.sleep(1)
+                    if not await captcha_detector.quick_check(page, marketplace):
+                        captcha_disappeared = True
+                        logger.info(f"✅ Captcha disappeared after {wait_attempt + 1}s!")
+                        break
+                
+                if not captcha_disappeared:
                     logger.error("❌ Captcha still present after solving")
                     await asyncio.sleep(2)
                     continue # Failed attempt, try again
                 
                 logger.info("✅ Captcha solved successfully! Resuming warmup...")
                 
+                # 🔥 NEW: COOLDOWN після успішного вирішення (дати Shein "остигнути")
+                cooldown_time = random.uniform(15, 25)
+                logger.info(f"⏱️ Cooldown {cooldown_time:.1f}s to let {marketplace} settle...")
+                await asyncio.sleep(cooldown_time)
+                
+                # 🔥 CRITICAL FIX: CHECK FOR "ACCESS TIMED OUT" & RELOAD
+                # Якщо сторінка "померла" поки ми вирішували капчу
+                try:
+                    timed_out = await page.get_by_text("Access timed out").is_visible()
+                    refresh_needed = await page.get_by_text("please refresh the page").is_visible()
+                    
+                    if timed_out or refresh_needed or context == "browsing":
+                        logger.info("🔄 Page stale after captcha. Reloading to restore session...")
+                        await page.reload(wait_until="domcontentloaded")
+                        await asyncio.sleep(5)
+                        
+                        # Після релоаду може знову вилізти попап
+                        await self.close_popups(page, marketplace)
+                except Exception as e:
+                    logger.warning(f"Error during post-captcha reload: {e}")
+                
                 # Restore image blocking
-                # Restore image blocking based on marketplace
                 if marketplace == 'aliexpress':
                     page.image_blocking_enabled = True
                     logger.info("   🚫 Images BLOCKED again (AliExpress)")
@@ -601,12 +644,23 @@ class AutoWarmup:
             page.image_blocking_enabled = True
         else:
             page.image_blocking_enabled = False
-            
-        return False # Failed after all attempts
+        
+        # 🔥 Context-aware failure handling
+        if context == "browsing":
+            logger.warning(f"⚠️ Failed to solve captcha in {context} mode, but continuing (non-fatal)")
+            return True  # Don't fail session for browsing captchas
+        else:
+            logger.error(f"❌ Failed to solve captcha in {context} mode")
+            return False # Failed after all attempts
+
 
     async def _natural_scroll(self, page: Page):
         """Simulates human-like scrolling behavior."""
         try:
+            # Safety check: ensure body exists
+            if not await page.evaluate("() => !!document.body"):
+                return
+
             total_height = await page.evaluate("document.body.scrollHeight")
             viewport_height = await page.evaluate("window.innerHeight")
             current_y = 0
@@ -635,42 +689,35 @@ class AutoWarmup:
             logger.warning(f"Scroll error: {e}")
 
     async def _warmup_generic(self, marketplace, config, specific_proxy=None, specific_session_file=None):
-        """Universal logic for warmup with improved human behavior."""
+        """
+        True "Random Walker" Logic:
+        1. Homepage -> 2. Click Random Banner/Menu -> 3. Scroll & Click Random Product
+        """
         
-        # Determine target session file
+        # Setup Proxy & Paths
         target_session_file = specific_session_file if specific_session_file else config['cookie_file']
-        target_proxy_file = config['proxy_file'] # We might not need to save proxy if specific_proxy is used, but for consistency...
+        target_proxy_file = config['proxy_file']
 
         if specific_proxy:
-            # Targeted Warmup
             selected_proxies = [specific_proxy]
-            logger.info(f"🎯 Targeted warmup for proxy: {specific_proxy.get('server')}")
         else:
-            # Pool Warmup
             self.proxy_manager.load_proxies()
             all_proxies = self.proxy_manager.get_all_proxies()
-            
-            if not all_proxies:
-                logger.error("❌ No proxies available")
-                return False
-            
-            # Shuffle proxies for randomness
+            if not all_proxies: return False
             random.shuffle(all_proxies)
-            selected_proxies = all_proxies[:10]  # Try up to 10 unique proxies
-        
+            selected_proxies = all_proxies[:3] # Try up to 3 proxies
+
         async with async_playwright() as p:
             for proxy_dict in selected_proxies:
-
-                # Reset valid flag for each proxy attempt
                 session_valid = True
+                logger.info(f"🚀 [RandomWalker] Trying proxy: {proxy_dict['server']}")
                 
+                # --- Browser Setup ---
                 proxy_config = {"server": proxy_dict['server']}
                 if proxy_dict.get('username'):
                     proxy_config['username'] = proxy_dict['username']
                     proxy_config['password'] = proxy_dict.get('password')
-                
-                logger.info(f"🚀 Trying proxy: {proxy_dict['server']}")
-                
+
                 try:
                     browser = await p.chromium.launch(
                         headless=settings.HEADLESS,
@@ -681,14 +728,15 @@ class AutoWarmup:
                     context = await browser.new_context(
                         viewport={'width': 1920, 'height': 1080},
                         locale='en-US',
-                        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+                        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
                     )
                     
-                    # Stealth
+                    # Apply Stealth & Route Images
                     try:
                         from playwright_stealth import Stealth
                         stealth = Stealth()
                         page = await context.new_page()
+                        
                         # Images optimization:
                         async def image_route_handler(route):
                             if getattr(page, "image_blocking_enabled", False):
@@ -704,10 +752,11 @@ class AutoWarmup:
                         else:
                             page.image_blocking_enabled = False 
                             logger.info("   🖼️ Images initially ENABLED")
+                            
                         await stealth.apply_stealth_async(page)
                     except:
                         if 'page' not in locals(): page = await context.new_page()
-                    
+
                     # 1. Check IP
                     try:
                         await page.goto("https://api.ipify.org", timeout=15000)
@@ -715,88 +764,152 @@ class AutoWarmup:
                     except:
                         await browser.close()
                         continue
-                    
-                    # 2. Navigation with CAPTCHA CHECK
-                    logger.info(f"🎯 Navigating to {marketplace}...")
-                    try:
-                        await page.goto(config['target'], timeout=30000)
-                    except:
-                        logger.warning("Main page timeout, but trying to continue...")
 
-                    await asyncio.sleep(random.uniform(3, 6))
+                    # --- STEP 1: LAND ON HOMEPAGE ---
+                    target_url = config['target']
+                    logger.info(f"1️⃣ Landing on Homepage: {target_url}")
                     
-                    # 🔥 CHECK 1: After initial load
-                    if not await self.check_and_solve_captcha(page, marketplace):
-                        logger.warning("⚠️ Failed to solve captcha on entry. Closing browser.")
-                        session_valid = False
+                    try:
+                        await page.goto(target_url, timeout=45000, wait_until="domcontentloaded")
+                    except:
+                        logger.warning("   ⚠️ Timeout on entry, reloading...")
+                        try: await page.reload()
+                        except: pass
+
+                    await asyncio.sleep(random.uniform(4, 7))
+
+                    # 🛡️ CAPTCHA & POPUPS (Essential on Homepage)
+                    if not await self.check_and_solve_captcha(page, marketplace, context="entry"):
+                        logger.warning("   ❌ Failed entry captcha. Closing.")
+                        session_valid = False # Fail session
                         await browser.close()
                         continue
-                    
-                    # 🌍 REGIONAL SETTINGS
+
+                    # 🔥 CLOSE POPUPS & ACCEPT COOKIES IMMEDIATELY
+                    await self.close_popups(page, marketplace)
                     await self.set_regional_settings(page, marketplace)
 
-                    # 🖱️ Scroll logic (Human)
-                    logger.info("📜 Scrolling naturally...")
+                    # --- STEP 2: FIND "INTERESTING" LINKS (Banners/Categories) ---
+                    # We want to click what a human clicks (Images, Big text), NOT "Privacy Policy" or "Login"
+                    logger.info("2️⃣ Looking for something interesting to click...")
                     await self._natural_scroll(page)
                     
-                    # 🔥 CHECK 2: After scroll
-                    if not await self.check_and_solve_captcha(page, marketplace):
-                        session_valid = False
-                        await browser.close()
-                        continue
-                    
-                    # 🔥 CLOSE POPUPS
-                    await self.close_popups(page, marketplace)
-
-                    # 🔥 ADDITIONAL WARM-UP PRODUCTS (Expanded)
-                    logger.info("🔥 Visiting products...")
-                    
-                    # Use provided list + extract random links from current page
-                    warmup_list = list(config['warmup_products'])
-                    
-                    # Visit 6 to 9 pages (User wanted longer warmup)
-                    pages_to_visit = random.randint(6, 9)
-                    selected_warmup = random.sample(
-                        warmup_list, 
-                        min(pages_to_visit, len(warmup_list))
-                    )
-                    
-                    for idx, warmup_url in enumerate(selected_warmup, 1):
-                        try:
-                            # 🔥 CHECK 3: Before visiting product
-                            if not await self.check_and_solve_captcha(page, marketplace):
-                                logger.warning("Captcha blocking warmup. Stopping.")
-                                session_valid = False
-                                break
+                    interesting_links = await page.evaluate("""
+                        () => {
+                            const links = [];
+                            const badKeywords = ['login', 'register', 'signin', 'signup', 'help', 'terms', 'privacy', 'about', 'contact', 'affiliate', 'app'];
+                            
+                            // Get all links
+                            document.querySelectorAll('a').forEach(el => {
+                                // Must be visible
+                                const rect = el.getBoundingClientRect();
+                                if (rect.width < 10 || rect.height < 10 || rect.top > window.innerHeight * 2) return;
                                 
-                            logger.info(f"  [{idx}/{len(selected_warmup)}] Visiting product...")
-                            await page.goto(warmup_url, timeout=30000)
+                                // Must be internal URL
+                                if (!el.href.includes(window.location.hostname)) return;
+                                
+                                const href = el.href.toLowerCase();
+                                const text = el.innerText.toLowerCase();
+                                
+                                // Filter out "utility" links
+                                if (badKeywords.some(kw => href.includes(kw) || text.includes(kw))) return;
+                                
+                                // Prioritize links with images inside (Banners!)
+                                const hasImg = el.querySelector('img') !== null;
+                                
+                                links.push({href: el.href, hasImg: hasImg});
+                            });
                             
-                            # Random pause on page
-                            await asyncio.sleep(random.uniform(4, 8))
-                            
-                            # 🔥 CHECK 4: On product page
-                            if not await self.check_and_solve_captcha(page, marketplace):
-                                session_valid = False
-                                break
+                            // Return mostly links with images, or just any valid link
+                            const imgLinks = links.filter(l => l.hasImg);
+                            return imgLinks.length > 0 ? imgLinks.map(l => l.href) : links.map(l => l.href);
+                        }
+                    """)
 
-                            # Scroll product page
-                            await self._natural_scroll(page)
-                            
-                        except Exception as e:
-                            logger.warning(f"  Error on product: {e}")
-                            await asyncio.sleep(2)
-                            continue
+                    if not interesting_links:
+                        logger.warning("   ⚠️ No interesting links found. Staying on homepage.")
+                    else:
+                        # Pick a random "Interest"
+                        # Weight towards top results (usually main banners) but keep it random
+                        # Take top 10 unique links
+                        unique_links = list(set(interesting_links))
+                        chosen_category = random.choice(unique_links[:12]) 
+                        logger.info(f"   🖱️ User 'clicked': {chosen_category[:60]}...")
+                        
+                        try:
+                            # Navigate to the chosen category/banner
+                            await page.goto(chosen_category, wait_until="domcontentloaded")
+                            await asyncio.sleep(random.uniform(3, 6))
+                        except: pass
 
-                    # --- SUCCESS CHECK ---
-                    if session_valid: 
+                    # --- STEP 3: FIND & CLICK PRODUCTS ---
+                    # Now we are inside a category (or still on home), look for products
+                    logger.info("3️⃣ Looking for products...")
+                    await self._natural_scroll(page)
+                    
+                    product_links = await page.evaluate("""
+                        () => {
+                            const links = [];
+                            const selectors = [
+                                'a[href*="-p-"]',           // Shein
+                                'a[href*="/p-"]',           // Shein
+                                'a.S-product-item__link',   // Shein Class
+                                'a[href*=".html"]',         // Ali/Temu
+                                '.product-list a',          
+                                '.product-card a'
+                            ];
+                            
+                            for (let sel of selectors) {
+                                document.querySelectorAll(sel).forEach(el => {
+                                    if(el.href && el.href.startsWith('http') && !links.includes(el.href)) {
+                                        links.push(el.href);
+                                    }
+                                });
+                                if (links.length > 5) break; 
+                            }
+                            return links.slice(0, 15);
+                        }
+                    """)
+
+                    if product_links:
+                        # Visit 2-3 random products found in this flow
+                        products_to_visit = random.sample(product_links, min(3, len(product_links)))
+                        
+                        for idx, prod_link in enumerate(products_to_visit):
+                            logger.info(f"   👕 Viewing Product [{idx+1}]: {prod_link[:60]}...")
+                            
+                            try:
+                                await page.goto(prod_link, wait_until="domcontentloaded")
+                                
+                                # Check for Rate Limit Captcha
+                                if not await self.check_and_solve_captcha(page, marketplace, context="browsing"):
+                                    logger.warning("   🛑 Rate Limit. Stopping session.")
+                                    session_valid = False
+                                    break 
+                                
+                                await self._natural_scroll(page)
+                                await asyncio.sleep(random.uniform(5, 12)) # Longer read time
+                                
+                                # 50% chance to go back to category
+                                if idx < len(products_to_visit) - 1 and random.random() < 0.5:
+                                    logger.info("   🔙 Going back...")
+                                    await page.go_back()
+                                    await asyncio.sleep(2)
+                                    
+                            except Exception as e:
+                                logger.warning(f"Error visiting product: {e}")
+                                continue
+                                
+                    else:
+                        logger.warning("   ⚠️ No products found in this category.")
+
+                    # --- STEP 4: SAVE ---
+                    if session_valid:
+                        logger.info(f"✅ Random Walk Complete. Saving session to {target_session_file}")
                         try:
                             await context.storage_state(path=target_session_file)
-                            logger.info(f"💾 Session saved to {target_session_file}")
                             
-                            # Only update the 'sticky' proxy file if we are doing a generic warmup
-                            # If targeted, the proxy is already fixed.
-                            if not specific_proxy and proxy_dict:
+                            if not specific_proxy:
                                 proxy_data = {
                                     "server": proxy_dict['server'],
                                     "username": proxy_dict.get('username'),
@@ -805,26 +918,23 @@ class AutoWarmup:
                                 }
                                 with open(target_proxy_file, "w") as f: json.dump(proxy_data, f, indent=2)
                                 logger.info(f"🎉 Saved session/proxy for {marketplace}")
-                                
-                            logger.info("✅ Warmup cycle finished.")
-                            await browser.close()
-                            return True  
-                            
                         except Exception as e:
                             logger.error(f"Failed to save session: {e}")
-                    else:
-                        logger.warning(f"⚠️ Session marked invalid (Captcha Failed). NOT saving session.")
+                        
                         await browser.close()
-                        return False 
-                    
+                        return True
+                    else:
+                        logger.warning("❌ Session invalid. Discarding.")
+                        await browser.close()
+
                 except Exception as e:
-                    logger.error(f"❌ Proxy failed: {e}")
+                    logger.error(f"❌ Error in Random Walker: {e}")
                     try: await browser.close()
                     except: pass
                     continue
             
             return False
-    
+
     async def warmup_shein(self, specific_proxy=None, specific_session_file=None):
         """Warmup для Shein"""
         return await self._warmup_generic('shein', self.WARMUP_URLS['shein'], specific_proxy, specific_session_file)

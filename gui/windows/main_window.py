@@ -62,12 +62,13 @@ class MainWindow(ctk.CTkFrame):
         self.table_headers = ctk.CTkFrame(self.monitor_frame, height=30)
         self.table_headers.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
         
-        headers = ["Thread ID", "Product ID", "Proxy IP", "Status"]
+        headers = ["Thread ID", "Group / ID", "Product Name", "Proxy IP", "Status of checking"]
         # Grid weights for columns
         self.table_headers.grid_columnconfigure(0, weight=1) # Thread ID
-        self.table_headers.grid_columnconfigure(1, weight=2) # Product ID
-        self.table_headers.grid_columnconfigure(2, weight=2) # Proxy IP
-        self.table_headers.grid_columnconfigure(3, weight=2) # Status
+        self.table_headers.grid_columnconfigure(1, weight=1) # Group ID
+        self.table_headers.grid_columnconfigure(2, weight=3) # Product
+        self.table_headers.grid_columnconfigure(3, weight=2) # Proxy IP
+        self.table_headers.grid_columnconfigure(4, weight=2) # Status
         
         for i, h in enumerate(headers):
             lbl = ctk.CTkLabel(self.table_headers, text=h, font=("Arial", 12, "bold"))
@@ -77,9 +78,10 @@ class MainWindow(ctk.CTkFrame):
         self.table_scroll = ctk.CTkScrollableFrame(self.monitor_frame)
         self.table_scroll.grid(row=1, column=0, sticky="nsew", padx=5, pady=0)
         self.table_scroll.grid_columnconfigure(0, weight=1) # Thread ID
-        self.table_scroll.grid_columnconfigure(1, weight=2) # Product ID
-        self.table_scroll.grid_columnconfigure(2, weight=2) # Proxy IP
-        self.table_scroll.grid_columnconfigure(3, weight=2) # Status
+        self.table_scroll.grid_columnconfigure(1, weight=1) # Group ID
+        self.table_scroll.grid_columnconfigure(2, weight=3) # Product
+        self.table_scroll.grid_columnconfigure(3, weight=2) # Proxy IP
+        self.table_scroll.grid_columnconfigure(4, weight=2) # Status
         
         self.rows = {} # option_id -> row_widgets (list)
 
@@ -128,11 +130,11 @@ class MainWindow(ctk.CTkFrame):
         self.engine = MonitorEngine(update_callback=self.update_row_safe, log_callback=self.log_safe)
         self.update_proxy_count() # Init count
 
-    def update_row_safe(self, t_id, p_id, ip, status):
+    def update_row_safe(self, t_id, p_id, p_name, ip, status):
         """Thread-safe GUI update for table rows."""
-        self.after(0, lambda: self._update_row(t_id, p_id, ip, status))
+        self.after(0, lambda: self._update_row(t_id, p_id, p_name, ip, status))
 
-    def _update_row(self, t_id, p_id, ip, status):
+    def _update_row(self, t_id, p_id, p_name, ip, status):
         """Internal method to update or create a row."""
         # Use t_id (Thread ID / Worker ID) as key for fixed rows per thread
         key = str(t_id) 
@@ -146,30 +148,43 @@ class MainWindow(ctk.CTkFrame):
 
         if key in self.rows:
             # Update existing status label (index 3)
-            # Row Widgets: [t_id_lbl, p_id_lbl, ip_lbl, status_lbl]
+            # Row Widgets: [t_id_lbl, group_lbl, p_name_lbl, ip_lbl, status_lbl]
             widgets = self.rows[key]
-            widgets[1].configure(text=p_id) # Update Product ID
-            widgets[2].configure(text=ip)   # Update IP
-            widgets[3].configure(text=status, text_color=color)
+            widgets[1].configure(text=str(p_id))   # Update Group ID
+            widgets[2].configure(text=p_name) # Update Product Name
+            widgets[3].configure(text=ip)   # Update IP
+            widgets[4].configure(text=status, text_color=color)
         else:
             # Create new
             row = ctk.CTkFrame(self.table_scroll, fg_color="transparent")
             row.pack(fill="x", pady=2)
             row.grid_columnconfigure(0, weight=1)
-            row.grid_columnconfigure(1, weight=2)
-            row.grid_columnconfigure(2, weight=2)
+            row.grid_columnconfigure(1, weight=1)
+            row.grid_columnconfigure(2, weight=3)
             row.grid_columnconfigure(3, weight=2)
+            row.grid_columnconfigure(4, weight=2)
             
-            w1 = ctk.CTkLabel(row, text=t_id)
-            w1.grid(row=0, column=0)
-            w2 = ctk.CTkLabel(row, text=p_id)
-            w2.grid(row=0, column=1)
-            w3 = ctk.CTkLabel(row, text=ip)
-            w3.grid(row=0, column=2)
-            w4 = ctk.CTkLabel(row, text=status, text_color=color)
-            w4.grid(row=0, column=3)
+            # 1. Thread ID
+            lbl_tid = ctk.CTkLabel(row, text=str(t_id), width=50)
+            lbl_tid.grid(row=0, column=0, sticky="ew")
             
-            self.rows[key] = [w1, w2, w3, w4]
+            # 2. Group ID (New)
+            lbl_gid = ctk.CTkLabel(row, text=str(p_id), width=50) # Keep concise
+            lbl_gid.grid(row=0, column=1, sticky="ew")
+
+            # 3. Product Name
+            lbl_name = ctk.CTkLabel(row, text=p_name, anchor="w")
+            lbl_name.grid(row=0, column=2, sticky="ew", padx=5)
+            
+            # 4. Proxy IP
+            lbl_ip = ctk.CTkLabel(row, text=ip, width=100)
+            lbl_ip.grid(row=0, column=3, sticky="ew")
+            
+            # 5. Status
+            lbl_status = ctk.CTkLabel(row, text=status, text_color=color, width=100)
+            lbl_status.grid(row=0, column=4, sticky="ew")
+            
+            self.rows[key] = [lbl_tid, lbl_gid, lbl_name, lbl_ip, lbl_status]
 
     def log_safe(self, msg):
         self.after(0, lambda: self.log(msg))

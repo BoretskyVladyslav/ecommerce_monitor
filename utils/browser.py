@@ -24,19 +24,39 @@ except Exception as e:
 
 class BrowserManager:
     def __init__(self):
-        # "Golden Standard" - Chrome 121 on Windows 10
-        # Fixed to avoid "IP Schizophrenia" and engine mismatch
-        self.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+        # Database of valid profiles (UA + Hints)
+        self.profiles = [
+            {
+                # Chrome 128 (Windows)
+                "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+                "hints": {
+                    'sec-ch-ua': '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
+                    'sec-ch-ua-mobile': '?0',
+                    'sec-ch-ua-platform': '"Windows"'
+                }
+            },
+            {
+                # Edge 128 (Windows)
+                "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 Edg/128.0.0.0",
+                "hints": {
+                    'sec-ch-ua': '"Chromium";v="128", "Not;A=Brand";v="24", "Microsoft Edge";v="128"',
+                    'sec-ch-ua-mobile': '?0',
+                    'sec-ch-ua-platform': '"Windows"'
+                }
+            },
+            {
+                 # Chrome 127 (Windows)
+                "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+                "hints": {
+                    'sec-ch-ua': '"Chromium";v="127", "Not;A=Brand";v="99", "Google Chrome";v="127"',
+                    'sec-ch-ua-mobile': '?0',
+                    'sec-ch-ua-platform': '"Windows"'
+                }
+            }
+        ]
         
-        # Critical: Client Hints headers that MUST match User-Agent
-        self.client_hints = {
-            'sec-ch-ua': '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
-            'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-platform': '"Windows"'
-        }
-        
-        # Mobile User Agent (iPhone with iOS 16.6) - matches cookie generation script
-        self.mobile_user_agent = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+        # Mobile User Agent (iPhone 14 Pro Max / iOS 17.4)
+        self.mobile_user_agent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
 
     async def get_context(self, playwright: Playwright, session_data: Dict = None, block_resources: bool = False, mobile_mode: bool = False, block_images: bool = True, simplified: bool = False) -> BrowserContext:
         """
@@ -89,7 +109,16 @@ class BrowserManager:
         
         # Use Fixed User Agent (from session or default Golden Standard)
         if not user_agent:
-            user_agent = self.mobile_user_agent if mobile_mode else self.user_agent
+            if mobile_mode:
+                user_agent = self.mobile_user_agent
+            else:
+                # ROTATION: Pick a random desktop profile
+                profile = random.choice(self.profiles)
+                user_agent = profile["ua"]
+                # Update hints for this specific context launch
+                # Note: We can't update self.client_hints globally as it affects other threads
+                # We will inject them into headers below
+                current_hints = profile["hints"]
 
         browser = await playwright.chromium.launch(**launch_options)
         
@@ -133,8 +162,9 @@ class BrowserManager:
                 'Upgrade-Insecure-Requests': '1',
                 'Referer': 'https://www.google.com/'
             }
-            # Add Client Hints
-            http_headers.update(self.client_hints)
+            # Add Client Hints (Will be updated with dynamic ones later)
+            # http_headers.update(self.client_hints) <--- REMOVED, effectively done below
+
             
             context_args = {
                 "viewport": {"width": 1920, "height": 1080},
@@ -144,6 +174,14 @@ class BrowserManager:
                 "timezone_id": "America/New_York",
                 "extra_http_headers": http_headers
             }
+            
+            # Inject dynamic client hints if we selected a random profile
+            if 'current_hints' in locals():
+                http_headers.update(current_hints)
+            else:
+                 # Fallback to default (Chrome 128) if user_agent was manual but no hints provided
+                 # Try to match? For now use default
+                 http_headers.update(self.profiles[0]["hints"])
         
         # Check for pre-saved session state (cookies from manual captcha solving)
         storage_state_file = None
@@ -224,18 +262,81 @@ class BrowserManager:
                     print(f"Failed to load cookies: {e}")
 
         # Value add: simplified mode skips weird JS injections that might flag us
+        # BUT we still need basic WebGL/Hardware spoofing to pass Geetest
+        
+        # Common Stealth Scripts (WebGL, Permissions, Chrome Runtime)
+        # Randomize Hardware data per session
+        concurrency = random.choice([4, 8, 12, 16])
+        memory = random.choice([4, 8, 16, 32])
+        
+        # Randomize Graphics Controller
+        renderer = random.choice([
+            'Intel(R) Iris(R) Xe Graphics',
+            'NVIDIA GeForce GTX 1650',
+            'NVIDIA GeForce RTX 3060',
+            'AMD Radeon RX 580'
+        ])
+        vendor = 'Google Inc. (NVIDIA)' if 'NVIDIA' in renderer else ('Google Inc. (AMD)' if 'AMD' in renderer else 'Intel Inc.')
+        
+        stealth_scripts = f"""
+            // 1. WebGL Spoofing (Dynamic)
+            try {{
+                const getParameter = WebGLRenderingContext.prototype.getParameter;
+                WebGLRenderingContext.prototype.getParameter = function(parameter) {{
+                    if (parameter === 37445) return '{vendor}'; // UNMASKED_VENDOR_WEBGL
+                    if (parameter === 37446) return '{renderer}'; // UNMASKED_RENDERER_WEBGL
+                    return getParameter(parameter);
+                }};
+                
+                const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
+                WebGL2RenderingContext.prototype.getParameter = function(parameter) {{
+                    if (parameter === 37445) return '{vendor}';
+                    if (parameter === 37446) return '{renderer}';
+                    return getParameter2(parameter);
+                }};
+            }} catch (e) {{}}
+
+            // 2. Chrome Runtime (often missing in automation)
+            try {{
+                if (!window.chrome) {{
+                    window.chrome = {{
+                        runtime: {{}}
+                    }};
+                }}
+            }} catch (e) {{}}
+
+            // 3. Permissions Query (Notification check often used by anti-bot)
+            try {{
+                const originalQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = (parameters) => (
+                    parameters.name === 'notifications' ?
+                    Promise.resolve({{ state: Notification.permission }}) :
+                    originalQuery(parameters)
+                );
+            }} catch (e) {{}}
+            
+            // 4. Hardware Concurrency & Memory (Mimic typical machine)
+            try {{
+                Object.defineProperty(navigator, 'hardwareConcurrency', {{get: () => {concurrency}}});
+                Object.defineProperty(navigator, 'deviceMemory', {{get: () => {memory}}});
+            }} catch(e) {{}}
+        """
+
         if not simplified:
-            # Enhanced Anti-detect script
-            await context.add_init_script("""
+            # Enhanced Anti-detect script + webdriver hiding
+            await context.add_init_script(stealth_scripts + """
                 // Hide webdriver traces
                 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
                 
-                // Spoof plugins (real Chrome has them, bots often don't)
-                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
+                // Spoof plugins
+                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
                 
-                // Spoof languages to match headers
+                // Spoof languages
                 Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
             """)
+        else:
+            # Even in simplified mode, we MUST apply WebGL spoofing for Geetest
+            await context.add_init_script(stealth_scripts)
         
         # Apply playwright-stealth (CRITICAL for Shein/Temu)
         # This patches many more detection vectors automatically

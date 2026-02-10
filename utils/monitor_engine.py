@@ -89,7 +89,7 @@ class MonitorEngine:
                     filtered_tasks.append(task)
                 
                 tasks = filtered_tasks
-                self.log(f"Found {len(tasks)} active tasks (after platform filter).")
+                self.log(f"Found {len(tasks)} active tasks")
                 
                 if not tasks:
                     await asyncio.sleep(5)
@@ -98,10 +98,14 @@ class MonitorEngine:
                 # 🔥 ENABLE SMART GROUPING (Optimization: 1 page load for N variants)
                 url_groups = {}
                 for task in tasks:
-                    url = task['url']
-                    if url not in url_groups:
-                        url_groups[url] = []
-                    url_groups[url].append(task)
+                    # GROUP BY PRODUCT_ID (or failover to URL)
+                    # This fixes the issue where different color URLs spawned multiple workers for the same product
+                    p_id = task.get('product_id')
+                    key = str(p_id) if p_id else task['url']
+                    
+                    if key not in url_groups:
+                        url_groups[key] = []
+                    url_groups[key].append(task)
                 
                 self.log(f"📦 Grouped into {len(url_groups)} unique URLs (was {len(tasks)} tasks)")
 
@@ -121,7 +125,10 @@ class MonitorEngine:
                         finally:
                             self.worker_ids.put_nowait(worker_id)
 
-                workers = [process_group_with_limit(url, group) for url, group in url_groups.items()]
+                # Sort groups by ID to respect order
+                sorted_groups = sorted(url_groups.items(), key=lambda x: int(x[0]) if x[0].isdigit() else x[0])
+                
+                workers = [process_group_with_limit(group[0]['url'], group) for key, group in sorted_groups]
                 await asyncio.gather(*workers)
                 
                 # Wait before next cycle
@@ -175,7 +182,7 @@ class MonitorEngine:
         last_error = None
         
         # Provide base status Update
-        self.update_gui(str(option_id), str(option_id), "Pending", "Queued")
+        self.update_gui(str(option_id), self._get_task_display_name(task), "Pending", "Queued")
 
         while attempt < max_retries and self.running:
             attempt += 1
@@ -294,7 +301,7 @@ class MonitorEngine:
             # ALWAYS log proxy for verification (critical for debugging)
             self.log(f"🔄 Attempt {attempt}/{max_retries} | Proxy: {proxy_display}")
             
-            self.update_gui(str(option_id), str(option_id), proxy_ip, f"Checking ({attempt}/{max_retries})...")
+            self.update_gui(str(option_id), self._get_task_display_name(task), proxy_ip, f"Checking ({attempt}/{max_retries})...")
             
             # Prepare Session Data for Browser
             proxy_url = None
@@ -762,7 +769,7 @@ class MonitorEngine:
 
             self.log(f"Failed to check {option_id} after {max_retries} attempts.")
             await self.db.add_log_entry(option_id, 0, -1, -1, f"Check Failed: {last_error}")
-            self.update_gui(str(option_id), str(option_id), "Failed", "Error")
+            self.update_gui(str(option_id), self._get_task_display_name(task), "Failed", "Error")
 
         else:
             # Success (either In Stock or Sold Out found)
@@ -776,7 +783,7 @@ class MonitorEngine:
             log_msg = f"Checked {marketplace} - {status_text}"
             await self.db.add_log_entry(option_id, 0, -1, status_code, log_msg)
             
-            self.update_gui(str(option_id), str(option_id), proxy_ip, status_text)
+            self.update_gui(str(option_id), self._get_task_display_name(task), proxy_ip, status_text)
 
     async def _process_task_group(self, url: str, group_tasks: List[Dict], worker_id: int):
         """
@@ -990,7 +997,7 @@ class MonitorEngine:
                                             status_text = "In Stock" if status == 0 else "Sold Out"
                                             await self.db.update_product_option_status(opt_id, status, table="product_options")
                                             self.log(f"   ✅ Bulk updated {opt_id} ({t_color}/{t_size}): {status_text}")
-                                            self.update_gui(str(worker_id), str(opt_id), "Bulk JSON", status_text)
+                                            self.update_gui(str(worker_id), task, proxy['server'], status_text)
                                             updated_option_ids.add(opt_id)
 
                         except Exception as json_e:
@@ -1044,7 +1051,7 @@ class MonitorEngine:
                                         status_text = "In Stock" if status == 0 else "Sold Out"
                                         await self.db.update_product_option_status(opt_id, status, table="product_options")
                                         self.log(f"   ✓ (DOM) {t_color}/{t_size} -> {status_text}")
-                                        self.update_gui(str(worker_id), str(opt_id), "DOM Matrix", status_text)
+                                        self.update_gui(str(worker_id), task, proxy['server'], status_text)
 
                             if not dom_matrix_success:
                                 self.log(f"⚠️ DOM Matrix failed/skipped. Checking {len(remaining_tasks)} items individually...")
@@ -1055,7 +1062,7 @@ class MonitorEngine:
                                     target_size = task.get('target_size')
                                     
                                     self.log(f"   [{i+1}/{len(remaining_tasks)}] Processing {target_color}/{target_size}...")
-                                    self.update_gui(str(worker_id), str(option_id), proxy_url, "Checking...")
+                                    self.update_gui(str(worker_id), task, proxy_url, "Checking...")
                                     
                                     # Call Parse with specific target
                                     try:
@@ -1069,7 +1076,7 @@ class MonitorEngine:
                                         
                                         await self.db.update_product_option_status(option_id, status_code, table="product_options")
                                         self.log(f"   ✅ Updated {option_id}: {status_text}")
-                                        self.update_gui(str(worker_id), str(option_id), proxy_url, status_text)
+                                        self.update_gui(str(worker_id), task, proxy_url, status_text)
                                         
                                         # Human delay between variants
                                         if i < len(remaining_tasks) - 1:
@@ -1082,7 +1089,7 @@ class MonitorEngine:
                                         raise
                                     except Exception as e:
                                         self.log(f"   ❌ Failed {option_id}: {e}")
-                                        self.update_gui(str(worker_id), str(option_id), proxy_url, "Error")
+                                        self.update_gui(str(worker_id), task, proxy_url, "Error")
 
                         # 🔥 SAVE SESSION
                         try:
@@ -1140,6 +1147,25 @@ class MonitorEngine:
         
         self.log(f"❌ Failed to process group after {max_retries} attempts")
 
+    def _get_task_display_name(self, task):
+        """Helper to format task name for GUI"""
+        title = task.get('product_title') or str(task['option_id'])
+        # Truncate title if too long
+        if len(title) > 40:
+            title = title[:37] + "..."
+            
+        color = task.get('target_color')
+        size = task.get('target_size')
+        
+        extras = []
+        if color: extras.append(color)
+        if size: extras.append(size)
+        
+        if extras:
+            return f"{title} ({'/'.join(extras)})"
+        return title
+
+
 
     def update_settings(self):
         """Reloads settings if they change during runtime (Global settings object is mutable)."""
@@ -1151,6 +1177,12 @@ class MonitorEngine:
         else:
             print(f"[Engine] {msg}")
 
-    def update_gui(self, t_id, p_id, ip, status):
+    def update_gui(self, t_id, task_data, ip, status):
         if self.update_callback:
-            self.update_callback(t_id, p_id, ip, status)
+            # Pass full task data or just specific fields?
+            # Let's pass (t_id, product_id, product_title/option_name, ip, status)
+            # But the signature in main_window is fixed.
+            # Let's change the signature there too.
+            p_id = task_data.get('product_id', 'N/A')
+            p_name = self._get_task_display_name(task_data)
+            self.update_callback(t_id, p_id, p_name, ip, status)

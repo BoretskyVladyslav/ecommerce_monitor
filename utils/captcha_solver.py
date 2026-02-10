@@ -62,8 +62,7 @@ class CaptchaSolution:
 
 class CaptchaSolver:
     """
-    Універсальний сервіс для вирішення капчі.
-    Підтримує 2Captcha та CapMonster Cloud APIs.
+    Сервіс для вирішення капчі через 2Captcha API.
     """
     
     CONFIG_FILE = Path("config/captcha_config.json")
@@ -79,8 +78,8 @@ class CaptchaSolver:
         self.config = self._load_config()
         self.session = None
         
-        # Вибираємо активний сервіс
-        self.active_service = self.config.get("service", "capmonster").lower()
+        # Завжди використовуємо 2Captcha
+        self.active_service = "2captcha"
         
         if not self.config.get("enabled", False):
             logger.warning("⚠️ CaptchaSolver is DISABLED in config")
@@ -104,8 +103,8 @@ class CaptchaSolver:
     def _create_default_config(self):
         """Створює конфігурацію за замовчуванням"""
         default_config = {
-            "service": "capmonster",
-            "enabled": False,
+            "service": "2captcha",
+            "enabled": True,
             "max_retries": 3,
             "fallback_to_manual": True,
             "2captcha": {
@@ -114,11 +113,10 @@ class CaptchaSolver:
                 "timeout_seconds": 120,
                 "poll_interval_seconds": 5
             },
-            "capmonster": {
-                "api_key": "YOUR_CAPMONSTER_API_KEY_HERE",
-                "api_url": "https://api.capmonster.cloud",
-                "timeout_seconds": 120,
-                "poll_interval_seconds": 3
+            "pricing": {
+                "2captcha_slider": 2.99,
+                "2captcha_recaptcha": 2.99,
+                "2captcha_geetest": 2.99
             }
         }
         
@@ -289,198 +287,6 @@ class CaptchaSolver:
             # Token or plain text
             return solution
     
-    # ==================== CapMonster Cloud API ====================
-    
-    async def _solve_capmonster(
-        self,
-        captcha_type: str,
-        image_base64: Optional[str] = None,
-        additional_params: Optional[Dict] = None
-    ) -> CaptchaSolution:
-        """
-        Вирішує капчу через CapMonster Cloud API.
-        
-        Args:
-            captcha_type: Тип капчі
-            image_base64: Base64 зображення
-            additional_params: Додаткові параметри
-        """
-        start_time = time.time()
-        config = self.config.get("capmonster", {})
-        api_key = config.get("api_key", "")
-        api_url = config.get("api_url", "https://api.capmonster.cloud")
-        
-        if not api_key or "YOUR_" in api_key:
-            raise SolverAPIError("CapMonster API key not configured")
-        
-        session = await self._get_session()
-        
-        try:
-            # 1. Create task
-            logger.info(f"📤 Submitting to CapMonster: {captcha_type}")
-            
-            task_data = self._build_capmonster_task(
-                captcha_type, image_base64, additional_params
-            )
-            
-            create_payload = {
-                "clientKey": api_key,
-                "task": task_data
-            }
-            
-            async with session.post(
-                f"{api_url}/createTask",
-                json=create_payload
-            ) as resp:
-                result = await resp.json()
-                
-                if result.get("errorId", 0) != 0:
-                    raise SolverAPIError(f"CapMonster error: {result.get('errorDescription')}")
-                
-                task_id = result.get("taskId")
-                logger.info(f"✅ Task created: {task_id}")
-            
-            # 2. Poll for result
-            timeout = config.get("timeout_seconds", 120)
-            poll_interval = config.get("poll_interval_seconds", 3)
-            elapsed = 0
-            
-            while elapsed < timeout:
-                await asyncio.sleep(poll_interval)
-                elapsed += poll_interval
-                
-                async with session.post(
-                    f"{api_url}/getTaskResult",
-                    json={"clientKey": api_key, "taskId": task_id}
-                ) as resp:
-                    result = await resp.json()
-                    
-                    if result.get("errorId", 0) != 0:
-                        raise SolverAPIError(f"CapMonster error: {result.get('errorDescription')}")
-                    
-                    status = result.get("status")
-                    
-                    if status == "ready":
-                        # Solved!
-                        solve_time = time.time() - start_time
-                        solution_data = result.get("solution", {})
-                        
-                        logger.info(f"✅ CapMonster solved in {solve_time:.1f}s")
-                        
-                        return CaptchaSolution(
-                            solved=True,
-                            solution_type=self._get_solution_type(captcha_type),
-                            data=self._parse_capmonster_solution(solution_data, captcha_type),
-                            cost=self._get_capmonster_cost(captcha_type),
-                            solve_time=solve_time,
-                            service="capmonster"
-                        )
-                    
-                    elif status == "processing":
-                        logger.debug(f"⏳ Waiting for solution... ({elapsed}s)")
-                        continue
-                    
-                    else:
-                        raise SolverAPIError(f"CapMonster unknown status: {status}")
-            
-            raise SolverTimeoutError(f"CapMonster timeout after {timeout}s")
-            
-        except Exception as e:
-            logger.error(f"❌ CapMonster error: {e}")
-            raise
-    
-    def _build_capmonster_task(
-        self,
-        captcha_type: str,
-        image_base64: Optional[str],
-        params: Optional[Dict]
-    ) -> Dict:
-        """Будує task payload для CapMonster"""
-        params = params or {}
-        
-        if captcha_type == "slider":
-            return {
-                "type": "ImageToCoordinatesTask",
-                "body": image_base64,
-                "comment": "Click on the slider"
-            }
-        
-        elif captcha_type == "geetest":
-            return {
-                "type": "GeeTestTask",
-                "websiteURL": params.get("page_url", ""),
-                "gt": params.get("gt", ""),
-                "challenge": params.get("challenge", "")
-            }
-        
-        elif captcha_type == "funcaptcha":
-            return {
-                "type": "FunCaptchaTask",
-                "websiteURL": params.get("page_url", ""),
-                "websitePublicKey": params.get("public_key", "")
-            }
-        
-        elif captcha_type == "recaptcha_v2":
-            return {
-                "type": "RecaptchaV2Task",
-                "websiteURL": params.get("page_url", ""),
-                "websiteKey": params.get("site_key", "")
-            }
-        
-        elif captcha_type == "click_points":
-            return {
-                "type": "ImageToCoordinatesTask",
-                "body": image_base64,
-                "comment": params.get("instructions", "Click in sequence")
-            }
-        
-        elif captcha_type == "rotate":
-            return {
-                "type": "RotateTask",
-                "body": image_base64
-            }
-        
-        else:
-            # Generic image task
-            return {
-                "type": "ImageToTextTask",
-                "body": image_base64
-            }
-    
-    def _parse_capmonster_solution(self, solution: Dict, captcha_type: str) -> Any:
-        """Парсить рішення від CapMonster"""
-        if captcha_type in ["slider", "click_points"]:
-            # Coordinates
-            coordinates = solution.get("coordinates", [])
-            return [{"x": c[0], "y": c[1]} for c in coordinates]
-        
-        elif captcha_type == "rotate":
-            return solution.get("rotate", 0)
-        
-        elif captcha_type == "geetest":
-            return {
-                "challenge": solution.get("challenge"),
-                "validate": solution.get("validate"),
-                "seccode": solution.get("seccode")
-            }
-        
-        elif captcha_type in ["recaptcha_v2", "funcaptcha"]:
-            return solution.get("gRecaptchaResponse") or solution.get("token")
-        
-        else:
-            return solution.get("text", "")
-    
-    def _get_capmonster_cost(self, captcha_type: str) -> float:
-        """Приблизна вартість вирішення"""
-        costs = {
-            "slider": 0.0008,
-            "geetest": 0.002,
-            "funcaptcha": 0.002,
-            "recaptcha_v2": 0.001,
-            "click_points": 0.0008,
-            "rotate": 0.0008
-        }
-        return costs.get(captcha_type, 0.001)
     
     def _get_solution_type(self, captcha_type: str) -> str:
         """Визначає тип рішення"""
@@ -527,23 +333,16 @@ class CaptchaSolver:
                 logger.error(f"❌ Failed to read image: {e}")
                 return CaptchaSolution(solved=False)
         
-        # Вибираємо сервіс
+        # Використовуємо тільки 2Captcha
         max_retries = self.config.get("max_retries", 3)
         
         for attempt in range(1, max_retries + 1):
             try:
                 logger.info(f"🔄 Solve attempt {attempt}/{max_retries}")
                 
-                if self.active_service == "capmonster":
-                    solution = await self._solve_capmonster(
-                        captcha_type, image_base64, additional_params
-                    )
-                elif self.active_service == "2captcha":
-                    solution = await self._solve_2captcha(
-                        captcha_type, image_base64, additional_params
-                    )
-                else:
-                    raise SolverError(f"Unknown service: {self.active_service}")
+                solution = await self._solve_2captcha(
+                    captcha_type, image_base64, additional_params
+                )
                 
                 if solution.solved:
                     logger.info(f"✅ Captcha solved successfully!")
@@ -570,37 +369,21 @@ class CaptchaSolver:
         return CaptchaSolution(solved=False)
     
     async def get_balance(self) -> Optional[float]:
-        """Отримує баланс активного сервісу"""
+        """Отримує баланс 2Captcha"""
         try:
             session = await self._get_session()
+            config = self.config.get("2captcha", {})
+            api_key = config.get("api_key", "")
+            api_url = config.get("api_url")
             
-            if self.active_service == "capmonster":
-                config = self.config.get("capmonster", {})
-                api_key = config.get("api_key", "")
-                api_url = config.get("api_url")
-                
-                async with session.post(
-                    f"{api_url}/getBalance",
-                    json={"clientKey": api_key}
-                ) as resp:
-                    result = await resp.json()
-                    balance = result.get("balance", 0)
-                    logger.info(f"💰 CapMonster balance: ${balance:.2f}")
-                    return balance
-            
-            elif self.active_service == "2captcha":
-                config = self.config.get("2captcha", {})
-                api_key = config.get("api_key", "")
-                api_url = config.get("api_url")
-                
-                async with session.get(
-                    f"{api_url}/res.php",
-                    params={"key": api_key, "action": "getbalance", "json": 1}
-                ) as resp:
-                    result = await resp.json()
-                    balance = float(result.get("request", 0))
-                    logger.info(f"💰 2Captcha balance: ${balance:.2f}")
-                    return balance
+            async with session.get(
+                f"{api_url}/res.php",
+                params={"key": api_key, "action": "getbalance", "json": 1}
+            ) as resp:
+                result = await resp.json()
+                balance = float(result.get("request", 0))
+                logger.info(f"💰 2Captcha balance: ${balance:.2f}")
+                return balance
         
         except Exception as e:
             logger.error(f"❌ Failed to get balance: {e}")
