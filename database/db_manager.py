@@ -200,7 +200,7 @@ class DatabaseManager:
             variants_query = """
                 SELECT id, option_name_1, option_name_2, url 
                 FROM product_options 
-                WHERE product_id = %s
+                WHERE product_id = %s AND status != -1
             """
             variants = await self.fetch_all(variants_query, (p_id,))
             
@@ -259,35 +259,50 @@ class DatabaseManager:
         logger.info(f"Generated {len(tasks)} tasks.")
         return tasks
 
-    async def update_product_option_status(self, option_id: int, status: int, table: str = "monitored_product_options"):
+    async def update_product_option_status(
+        self,
+        option_id: int,
+        status: int,
+        table: str = "monitored_product_options",
+        price: float = None,
+        original_price: float = None
+    ):
         """
-        Updates status for a monitored option (1=In Stock, 0=Sold Out).
-        Args:
-            option_id: ID of the record
-            status: New status
-            table: 'product_options' or 'monitored_product_options' (legacy)
+        Updates status (and optionally prices) for a monitored option.
+        status: 1=In Stock, 0=Sold Out, -1=Excluded by user
+        price: current sale price scraped from page
+        original_price: original/strikethrough price scraped from page
         """
         if table == "product_options":
-            # For variants table, we don't have updated_at in all schemas, 
-            # but usually good practice. If schema doesn't have it, SQL will ignore or optional?
-            # User schema showed `created_at` but NOT `updated_at` for product_options in Step 90 output!
-            # So I will NOT try to set updated_at for product_options to be safe, or check schema repeatedly.
-            # Step 90 output: product_options structure: id, product_id, option_name_1/2, url, type, prices, status, created_at.
-            # NO updated_at column in product_options.
-            query = """
-                UPDATE product_options 
-                SET status = %s
-                WHERE id = %s
-            """
+            if price is not None and original_price is not None:
+                query = """
+                    UPDATE product_options 
+                    SET status = %s, price_sale = %s, price_orig = %s, updated_at = NOW()
+                    WHERE id = %s
+                """
+                await self.execute(query, (status, price, original_price, option_id))
+            elif price is not None:
+                query = """
+                    UPDATE product_options 
+                    SET status = %s, price_sale = %s, updated_at = NOW()
+                    WHERE id = %s
+                """
+                await self.execute(query, (status, price, option_id))
+            else:
+                query = """
+                    UPDATE product_options 
+                    SET status = %s, updated_at = NOW()
+                    WHERE id = %s
+                """
+                await self.execute(query, (status, option_id))
         else:
-            # Legacy table has updated_at
+            # Legacy monitored_product_options table
             query = """
                 UPDATE monitored_product_options 
                 SET status = %s, updated_at = NOW()
                 WHERE id = %s
             """
-            
-        await self.execute(query, (status, option_id))
+            await self.execute(query, (status, option_id))
 
     async def add_log_entry(self, option_id: int, session_id: int, old_status: int, new_status: int, note: str):
         """Inserts a record into the history log."""
@@ -297,6 +312,65 @@ class DatabaseManager:
             VALUES (%s, %s, %s, %s, %s, NOW())
         """
         await self.execute(query, (option_id, session_id, old_status, new_status, note))
+
+    async def fetch_products_with_variants(self) -> list:
+        """
+        Fetches all products with their variants for the Variant Manager UI.
+        Returns a list of dicts: {product_id, title, url, variants: [...]}
+        """
+        products = await self.fetch_all(
+            "SELECT id, original_title, original_url FROM products ORDER BY id ASC"
+        )
+        result = []
+        for p in products:
+            variants = await self.fetch_all(
+                """
+                SELECT id, option_name_1, option_name_2, status, price_sale, price_orig, updated_at
+                FROM product_options
+                WHERE product_id = %s
+                ORDER BY option_name_1, option_name_2
+                """,
+                (p['id'],)
+            )
+            result.append({
+                'product_id': p['id'],
+                'title': p.get('original_title') or f"Product #{p['id']}",
+                'url': p.get('original_url') or '',
+                'variants': variants
+            })
+        return result
+
+    async def fetch_product_list(self) -> list:
+        """Lightweight fetch — products only, no variants. Used for the UI product header list."""
+        return await self.fetch_all(
+            "SELECT id, original_title, original_url FROM products ORDER BY id ASC"
+        )
+
+    async def fetch_variants_for_product(self, product_id: int) -> list:
+        """Fetch variants for a single product on demand (lazy loading)."""
+        return await self.fetch_all(
+            """
+            SELECT id, option_name_1, option_name_2, status,
+                   price_sale, price_orig, updated_at
+            FROM product_options
+            WHERE product_id = %s
+            ORDER BY option_name_1, option_name_2
+            """,
+            (product_id,)
+        )
+
+    async def toggle_variant_active(self, option_id: int, active: bool):
+        """
+        Sets variant active (status stays/becomes its last real value)
+        or inactive (status = -1, excluded from monitoring by user).
+        """
+        if active:
+            # Restore to 1 (In Stock assumed, engine will check correctly next cycle)
+            query = "UPDATE product_options SET status = 1, updated_at = NOW() WHERE id = %s AND status = -1"
+        else:
+            # Set to -1 = user-excluded
+            query = "UPDATE product_options SET status = -1, updated_at = NOW() WHERE id = %s"
+        await self.execute(query, (option_id,))
 
 
     async def close(self):

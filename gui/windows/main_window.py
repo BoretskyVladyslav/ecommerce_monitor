@@ -2,6 +2,8 @@ import customtkinter as ctk
 import asyncio
 import threading
 from gui.components.settings_modal import SettingsModal
+from gui.components.session_modal import SessionModal
+from gui.components.variants_tab import VariantsTab
 from utils.monitor_engine import MonitorEngine
 
 class MainWindow(ctk.CTkFrame):
@@ -31,7 +33,12 @@ class MainWindow(ctk.CTkFrame):
         # Settings Button (Icon/Text)
         self.btn_settings = ctk.CTkButton(self.top_panel, text="⚙️ Settings", fg_color="transparent", border_width=1, 
                                            text_color=("gray10", "gray90"), command=self.on_settings)
-        self.btn_settings.pack(side="right", padx=20, pady=15)
+        self.btn_settings.pack(side="right", padx=10, pady=15)
+
+        # Add Account Button (Blue)
+        self.btn_add_account = ctk.CTkButton(self.top_panel, text="➕ Add Account", fg_color="#3498db", hover_color="#2980b9",
+                                             width=120, command=self.on_add_account)
+        self.btn_add_account.pack(side="right", padx=10, pady=15)
 
         # ==========================================================
         # 2. TABVIEW: MONITOR | PROXY MANAGER
@@ -41,12 +48,15 @@ class MainWindow(ctk.CTkFrame):
         
         self.tab_monitor = self.tabview.add("Monitor")
         self.tab_proxy = self.tabview.add("Proxy Manager")
+        self.tab_products = self.tabview.add("Products 🗂️")
         
         # Configure layout for tabs
         self.tab_monitor.grid_columnconfigure(0, weight=1)
         self.tab_monitor.grid_rowconfigure(0, weight=1) # Table expands
         
         self.tab_proxy.grid_columnconfigure(0, weight=1)
+        self.tab_products.grid_columnconfigure(0, weight=1)
+        self.tab_products.grid_rowconfigure(0, weight=1)
 
         # ==========================================================
         # TAB 1: MONITOR (Table + Log)
@@ -130,6 +140,12 @@ class MainWindow(ctk.CTkFrame):
         self.engine = MonitorEngine(update_callback=self.update_row_safe, log_callback=self.log_safe)
         self.update_proxy_count() # Init count
 
+        # ==========================================================
+        # TAB 3: PRODUCTS / VARIANT MANAGER
+        # ==========================================================
+        self.variants_tab = VariantsTab(self.tab_products)
+        self.variants_tab.grid(row=0, column=0, sticky="nsew")
+
     def update_row_safe(self, t_id, p_id, p_name, ip, status):
         """Thread-safe GUI update for table rows."""
         self.after(0, lambda: self._update_row(t_id, p_id, p_name, ip, status))
@@ -203,28 +219,77 @@ class MainWindow(ctk.CTkFrame):
     def on_start(self):
         self.log("Starting Engine in background thread...")
         
-        # Re-set concurrency limit in case settings changed
-        self.engine.update_settings() 
+        # Re-set concurrency limit in case settings changed (guard against missing method)
+        if hasattr(self.engine, 'update_settings'):
+            self.engine.update_settings()
         
         self.thread = threading.Thread(target=self._async_thread_target, daemon=True)
         self.thread.start()
 
     def _async_thread_target(self):
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(self.engine.start())
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
         try:
-            loop.run_forever()
-        except:
-            pass
+            self.loop.run_until_complete(self.engine.start())
+            self.loop.run_forever()
+        except Exception as e:
+            print(f"Engine loop error: {e}")
+        finally:
+            # Drain any remaining callbacks before closing (prevents
+            # 'RuntimeError: Cannot close a running event loop' on Windows proactor)
+            try:
+                # Cancel all pending tasks
+                pending = asyncio.all_tasks(self.loop)
+                if pending:
+                    self.loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True)
+                    )
+            except Exception:
+                pass
+            try:
+                self.loop.close()
+            except Exception:
+                pass
+
+    def cleanup(self):
+        """Clean shutdown of async resources."""
+        self.log("Shutting down Application...")
+        if hasattr(self, 'engine'):
+            # This is synchronous call to async function? No, engine.stop is async.
+            # We need to schedule it on the loop if loop is running.
+            if hasattr(self, 'loop') and self.loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(self.engine.stop(), self.loop)
+                try:
+                    future.result(timeout=5)
+                except:
+                    pass
+                self.loop.call_soon_threadsafe(self.loop.stop)
+            else:
+                # If loop not running, just close DB manually?
+                # Probably engine.stop() needs loop.
+                pass
 
     def on_stop(self):
+        """Immediately stop the engine: set flag AND cancel the asyncio task."""
         self.log("Stopping Engine...")
         self.engine.running = False
-        self.log("Signal sent. Engine will stop after current cycle.")
+
+        # Schedule engine.stop() on the engine loop — this cancels the loop_task
+        # so asyncio.gather(*workers) is cancelled and browsers close cleanly.
+        if hasattr(self, 'loop') and self.loop and not self.loop.is_closed():
+            try:
+                asyncio.run_coroutine_threadsafe(self.engine.stop(), self.loop)
+                self.log("🚨 Stop signal sent. Engine will halt immediately.")
+            except Exception as e:
+                self.log(f"Stop signal error: {e}")
+        else:
+            self.log("Signal sent (loop not running).")
 
     def on_settings(self):
         SettingsModal(self)
+
+    def on_add_account(self):
+        SessionModal(self)
         
     def on_save_proxies(self):
         url = self.proxy_url_entry.get()

@@ -8,11 +8,13 @@ from utils.captcha_detector import captcha_detector
 from utils.captcha_solver import captcha_solver
 
 class BaseParser(ABC):
-    def __init__(self, page: Page):
+    def __init__(self, page: Page, marketplace: str = "generic"):
         self.page = page
-        self.logger = setup_logger(self.__class__.__name__)
-        # Визначаємо платформу на основі класу
-        if "AliExpress" in self.__class__.__name__:
+        
+        # Визначаємо платформу: або з аргументу, або з класу
+        if marketplace != "generic":
+            self.marketplace = marketplace
+        elif "AliExpress" in self.__class__.__name__:
             self.marketplace = "aliexpress"
         elif "Shein" in self.__class__.__name__:
             self.marketplace = "shein"
@@ -20,6 +22,9 @@ class BaseParser(ABC):
             self.marketplace = "temu"
         else:
             self.marketplace = "unknown"
+            
+        # Logger Setup
+        self.logger = setup_logger(f"{self.__class__.__name__}_{self.marketplace}")
             
         # Session path for saving state
         self.session_path = f"{self.marketplace}_session_state.json"

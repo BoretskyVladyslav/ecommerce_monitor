@@ -16,7 +16,16 @@ class Application(ctk.CTk):
         
     def run(self):
         self.setup_context_menu()
+        self.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.mainloop()
+
+    def on_closing(self):
+        """Handle window close event to cleanup resources."""
+        if hasattr(self, 'main_window') and hasattr(self.main_window, 'cleanup'):
+            self.main_window.cleanup()
+        self.destroy()
+        import sys
+        sys.exit(0)
 
     def setup_context_menu(self):
         """Adds global right-click context menu for Copy/Paste."""

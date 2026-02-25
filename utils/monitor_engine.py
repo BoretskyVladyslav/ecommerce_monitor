@@ -1,6 +1,9 @@
 import asyncio
 import logging
 import os
+import glob
+import re
+import csv
 from typing import Dict, List, Optional
 from datetime import datetime
 import random
@@ -127,7 +130,15 @@ class MonitorEngine:
 
                 # Sort groups by ID to respect order
                 sorted_groups = sorted(url_groups.items(), key=lambda x: int(x[0]) if x[0].isdigit() else x[0])
-                
+
+                # ── TEST LIMIT ─────────────────────────────────────────────
+                # Set TEST_LIMIT to 0 to process all groups, or N to cap at N
+                TEST_LIMIT = 0  # 0 = process ALL groups (production mode)
+                if TEST_LIMIT > 0:
+                    sorted_groups = sorted_groups[:TEST_LIMIT]
+                    self.log(f"🧪 TEST MODE: capped to {len(sorted_groups)} groups (set TEST_LIMIT=0 to run all)")
+                # ───────────────────────────────────────────────────────────
+
                 workers = [process_group_with_limit(group[0]['url'], group) for key, group in sorted_groups]
                 await asyncio.gather(*workers)
                 
@@ -178,6 +189,8 @@ class MonitorEngine:
         attempt = 0
         success = False
         status_code = 0 # Default Sold Out / Error
+        p_sale = None
+        p_orig = None
         status_text = "Error"
         last_error = None
         
@@ -317,12 +330,36 @@ class MonitorEngine:
                         proxy_url = proxy['server']
                 else:
                     proxy_url = proxy['server']
+            
+            # Use 'http://' by default for ip:port
+            if proxy_url and "://" not in proxy_url:
+                proxy_url = f"http://{proxy_url}"
 
             session_data = {
                 "proxy": proxy_url,
                 "user_agent": None, # Random will be picked
                 "url": url  # For auto-detecting saved session files
             }
+            
+            # --- SESSION LOADING LOGIC ---
+            session_file_path = None
+            try:
+                # Find all session files for this marketplace
+                sessions_dir = os.path.join("data", "sessions")
+                if os.path.exists(sessions_dir):
+                    # Pattern: *marketplace*.json (e.g. shein_user@gmail.com.json)
+                    pattern = os.path.join(sessions_dir, f"*{marketplace}*.json")
+                    potential_sessions = glob.glob(pattern)
+                    
+                    if potential_sessions:
+                        # Randomly pick one (or rotate based on worker_id if strictly needed)
+                        session_file_path = random.choice(potential_sessions)
+                        self.log(f"✅ Loaded session: {os.path.basename(session_file_path)}")
+                    else:
+                        self.log(f"⚠️ No session found for {marketplace}. Running as Guest.")
+            except Exception as e:
+                self.log(f"❌ Error searching for sessions: {e}")
+            # -----------------------------
 
             try:
                 async with async_playwright() as p:
@@ -352,7 +389,8 @@ class MonitorEngine:
                         block_resources=True,
                         mobile_mode=use_mobile,
                         block_images=should_block_images,
-                        simplified=is_simplified
+                        simplified=is_simplified,
+                        storage_state_path=session_file_path
                     )
                     
                     if use_mobile:
@@ -580,11 +618,164 @@ class MonitorEngine:
                         # Для інших маркетплейсів (Shein) - звичайна навігація
                         else:
                             parser = get_parser_for_url(url, page)
+                            # Custom navigation for Shein was already done via parser.Maps if calling existing parser logic
+                            # But here we are in the 'else' block which calls parser.Maps below.
+                            # parser.Maps(url) is essentially page.goto(url) with checks.
                             await parser.Maps(url)
+                            
+                            # --- 🚀 DATA EXTRACTION (Category Scraping) ---
+                            # Check if this is a category page by looking for product cards
+                            # Use logic from run_scrape_test.py
+                            card_count = await page.locator(".product-card, .S-product-item, .product-item").count()
+                            
+                            if card_count > 0:
+                                self.log(f"📦 Detected Category Page with {card_count}+ items. Extracting data...")
+                                
+                                # Scroll to load more
+                                for _ in range(3):
+                                    await page.mouse.wheel(0, 1000)
+                                    await asyncio.sleep(1.5)
+                                
+                                product_cards = await page.locator(".product-card, .S-product-item, .product-item").all()
+                                extracted_data = []
+                                
+                                for i, card in enumerate(product_cards[:20]): # Parse first 20
+                                    try:
+                                        # --- NAME ---
+                                        name = "Unknown"
+                                        name_el = card.locator("a.goods-title-link, .S-product-item__name a, .product-title a")
+                                        if await name_el.count() > 0:
+                                            name = await name_el.first.text_content()
+                                        else:
+                                            name_el = card.locator(".S-product-item__name, .product-title")
+                                            if await name_el.count() > 0:
+                                                name = await name_el.first.text_content()
+                                        
+                                        # Regex Cleaning for Title
+                                        # Remove leading -XX%, Local-XX%, etc.
+                                        name = name.strip()
+                                        name = re.sub(r'^([-]?\d+%|Local-[-]?\d+%)\s*', '', name, flags=re.IGNORECASE).strip()
+                                        
+                                        # --- PRICE ---
+                                        price = "N/A"
+                                        price_selectors = [
+                                            ".S-product-item__price", 
+                                            ".product-price__current-price", 
+                                            ".product-item__price",
+                                            "span[class*='price']",
+                                            ".S-product-item__sale-price",
+                                            ".product-price__sale-price" 
+                                        ]
+                                        for sel in price_selectors:
+                                            price_el = card.locator(sel)
+                                            if await price_el.count() > 0:
+                                                price_text = await price_el.first.text_content()
+                                                if price_text and "$" in price_text:
+                                                    price = price_text.strip()
+                                                    break
+                                        
+                                        # --- URL ---
+                                        product_url = "N/A"
+                                        link_el = card.locator("a").first
+                                        if await link_el.count() > 0:
+                                            href = await link_el.get_attribute("href")
+                                            if href:
+                                                if href.startswith("//"): href = "https:" + href
+                                                elif href.startswith("/"): href = "https://us.shein.com" + href
+                                                product_url = href
+                                        
+                                        # --- IMAGE ---
+                                        img_src = "N/A"
+                                        img_el = card.locator("img").first
+                                        if await img_el.count() > 0:
+                                            src = await img_el.get_attribute("src")
+                                            if not src or "data:image" in src:
+                                                src = await img_el.get_attribute("data-src")
+                                            if src and src.startswith("//"): src = "https:" + src
+                                            img_src = src
+                                            
+                                        extracted_data.append({
+                                            "name": name,
+                                            "price": price,
+                                            "url": product_url,
+                                            "image": img_src
+                                        })
+                                        
+                                    except Exception as e:
+                                        continue
+
+                                # SAVE DATA
+                                if extracted_data:
+                                    # Save to CSV
+                                    output_file = os.path.join("data", "output", f"shein_scrape_{int(datetime.now().timestamp())}.csv")
+                                    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+                                    
+                                    keys = extracted_data[0].keys()
+                                    with open(output_file, 'w', newline='', encoding='utf-8') as f:
+                                        writer = csv.DictWriter(f, fieldnames=keys)
+                                        writer.writeheader()
+                                        writer.writerows(extracted_data)
+                                    
+                                    self.log(f"🎉 Scraped {len(extracted_data)} products. Saved to {output_file}")
+                                    
+                                    # Update GUI/DB with first item status for the task
+                                    # Assuming task was for the category? If task was for product this might be weird.
+                                    # But user requested this loop.
+                                    pass
+                            
+                            # ----------------------------------------------
                             
                             # CRITICAL: Wait for page to "settle" / render dynamic content
                             load_wait = random.uniform(settings.DELAY_MIN, settings.DELAY_MAX)
                             await asyncio.sleep(load_wait)
+                            
+                            # --- SESSION VERIFICATION ---
+                            if session_file_path:
+                                try:
+                                    # Simple check for login indicators
+                                    content = await page.content()
+                                    if "Sign In" in content or "Register" in content:
+                                        # Be careful, "Sign In" might be in the header even if logged in (dropdown)
+                                        # Better to check for "My Orders" or user profile element
+                                        # This is a heuristic check.
+                                        pass
+                                    
+                                    # User requested logic:
+                                    # If the bot sees "Sign In" button -> Log "Session Invalid/Expired".
+                                    # If the bot sees "My Account" or profile icon -> Log "Session Active".
+                                    
+                                    # Generic selectors for "My Account" / Loop
+                                    indicators = [
+                                        "text='My Account'",
+                                        "text='My Orders'",
+                                        "a[href*='account']",
+                                        "a[href*='user']",
+                                        ".user-icon",
+                                        ".header-user",
+                                        ".j-header-user",
+                                        "i.iconfont-me"
+                                    ]
+                                    
+                                    is_logged_in = False
+                                    for ind in indicators:
+                                        if await page.locator(ind).first.is_visible():
+                                            is_logged_in = True
+                                            break
+                                    
+                                    if is_logged_in:
+                                        self.log(f"✅ Session Active (Verified on page)")
+                                    else:
+                                        # Double check for "Sign In" - if NOT present, maybe we are logged in?
+                                        # But let's stick to positive confirmation or negative "Sign In"
+                                        if await page.locator("text='Sign In'").first.is_visible():
+                                            self.log(f"⚠️ Session Invalid/Expired (Sign In detected)")
+                                        else:
+                                            # Ambiguous.
+                                            self.log(f"ℹ️ Session Login Status Unknown (Could not verify)")
+
+                                except Exception as e:
+                                    self.log(f"Warning during session verification: {e}")
+                            # ----------------------------
 
                         # 3. ПАРСИНГ
                         # Тепер ми ВЖЕ на сторінці товару, викликаємо парсер
@@ -611,7 +802,13 @@ class MonitorEngine:
                                 result = await parser.parse()
                         
                         # If we got here, success
-                        status_code = result
+                        if isinstance(result, dict):
+                            status_code = result.get('status', 0)
+                            p_sale = result.get('price_sale')
+                            p_orig = result.get('price_orig')
+                        else:
+                            status_code = result
+                            
                         status_text = "In Stock" if status_code == 1 else "Sold Out"
                         success = True
                         
@@ -676,18 +873,18 @@ class MonitorEngine:
                         except Exception as warmup_error:
                             self.log(f"❌ Critical Auto-warmup error: {warmup_error}")
                         
-                        # 2. Видаляємо старі сесії (вони вже не робочі)
+                        # 2. --- FIX 1A: NEVER delete Golden Sessions on Captcha ---
+                        # These are manually created sessions. Log a warning instead.
                         session_files = {
                             'shein': 'shein_session_state.json',
                             'aliexpress': 'aliexpress_session_state.json',
                             'temu': 'temu_session_state.json'
                         }
-                        session_file = session_files.get(marketplace)
-                        if session_file and os.path.exists(session_file):
-                            try:
-                                os.remove(session_file)
-                                self.log(f"🗑️ Deleted compromised session: {session_file}")
-                            except: pass
+                        legacy_session = session_files.get(marketplace)
+                        if legacy_session and os.path.exists(legacy_session):
+                            self.log(f"⚠️ Captcha detected but PRESERVING session: {legacy_session} (Golden Session protection)")
+                        # Do NOT delete session files here — they are hand-crafted Golden Sessions
+                        # ---------------------------------------------------------------
                             
                         # 3. НЕГАЙНО ВИХОДИМО з циклу спроб для ЦЬОГО товару
                         self.log(f"🛑 Breaking retry loop for current task")
@@ -751,21 +948,26 @@ class MonitorEngine:
             # 🔥 USER REQ: "If cookies don't pass more than 10 times, change everything"
             # We reached max_retries (10), so we Nuke the session/proxy to force rotation.
             if marketplace in ["shein", "temu", "aliexpress"]:
-                self.log(f"⚠️ Failed {max_retries} times for {marketplace}. Nuking session & proxy to force UPDATE.")
+                self.log(f"⚠️ Failed {max_retries} times for {marketplace}. Rotating proxy only (session preserved).")
                 
-                files_to_delete = []
-                # Session files
-                if marketplace == 'shein': files_to_delete.extend(['shein_session_state.json', 'shein_session_proxy.json'])
-                elif marketplace == 'aliexpress': files_to_delete.extend(['aliexpress_session_state.json', 'aliexpress_session_proxy.json'])
-                elif marketplace == 'temu': files_to_delete.extend(['temu_session_state.json', 'temu_session_proxy.json'])
+                # --- FIX 1B: NEVER delete Golden Sessions on max-retry failure ---
+                # Only rotate the sticky proxy file to get a fresh IP next cycle.
+                # The session (cookies) in data/sessions/ are manually created
+                # Golden Sessions and must NEVER be auto-deleted.
+                proxy_files_to_rotate = []
+                if marketplace == 'shein': proxy_files_to_rotate.append('shein_session_proxy.json')
+                elif marketplace == 'aliexpress': proxy_files_to_rotate.append('aliexpress_session_proxy.json')
+                elif marketplace == 'temu': proxy_files_to_rotate.append('temu_session_proxy.json')
                 
-                for f_name in files_to_delete:
+                for f_name in proxy_files_to_rotate:
                     if os.path.exists(f_name):
                         try:
                             os.remove(f_name)
-                            self.log(f"   🗑️ Deleted {f_name}")
+                            self.log(f"   🔄 Rotated sticky proxy file: {f_name} (will pick new proxy next cycle)")
                         except Exception as del_err:
-                            self.log(f"   ❌ Failed to delete {f_name}: {del_err}")
+                            self.log(f"   ❌ Failed to rotate proxy file {f_name}: {del_err}")
+                self.log(f"   🛡️ Golden Sessions in data/sessions/ are PRESERVED")
+                # -------------------------------------------------------------------
 
             self.log(f"Failed to check {option_id} after {max_retries} attempts.")
             await self.db.add_log_entry(option_id, 0, -1, -1, f"Check Failed: {last_error}")
@@ -774,7 +976,10 @@ class MonitorEngine:
         else:
             # Success (either In Stock or Sold Out found)
             table_to_update = task.get('table', 'monitored_product_options')
-            await self.db.update_product_option_status(option_id, status_code, table=table_to_update)
+            await self.db.update_product_option_status(
+                option_id, status_code, table=table_to_update,
+                price=p_sale, original_price=p_orig
+            )
             self.log(f"INFO: Updated status for ID {option_id} to '{status_text}' ({status_code})") # LOG 6: Success Update
             
             # We should probably fetch old status to log changes, but for now log result
@@ -833,11 +1038,19 @@ class MonitorEngine:
             try:
                 with open(proxy_file, 'r') as f:
                     proxy_data = json.load(f)
-                proxy = {
-                    'server': proxy_data['server'],
-                    'username': proxy_data.get('username'),
-                    'password': proxy_data.get('password')
-                }
+                # --- FIX 2: Robust proxy loading (handle both str and dict) ---
+                if isinstance(proxy_data, str):
+                    proxy = {'server': proxy_data, 'username': None, 'password': None}
+                elif isinstance(proxy_data, dict):
+                    server = proxy_data.get('server') or proxy_data.get('url') or str(proxy_data)
+                    proxy = {
+                        'server': server,
+                        'username': proxy_data.get('username'),
+                        'password': proxy_data.get('password')
+                    }
+                else:
+                    proxy = {'server': str(proxy_data), 'username': None, 'password': None}
+                # ---------------------------------------------------------------
                 self.log(f"🔗 [Worker {worker_id}] Using sticky proxy: {proxy['server']}")
             except Exception as e:
                 self.log(f"❌ [Worker {worker_id}] Failed to load proxy: {e}")
@@ -859,10 +1072,39 @@ class MonitorEngine:
                     json.dump(proxy_data, f, indent=2)
             except: pass
 
-        # 2. Get Session File unique to this Proxy
-        session_file = self.session_manager.get_session_path(marketplace, proxy_data)
+        # 2. Get Session File (Robust Lookup)
+        import glob
+        session_file = None
+        sessions_dir = os.path.join("data", "sessions")
+        
+        # Priority 1: Check if we have a specific session needed for this proxy?
+        # Ideally, any session for the marketplace works if we are rotating.
+        # But if we want sticky, we should try to match.
+        # For now, let's pick a valid one.
+        
+        try:
+            if os.path.exists(sessions_dir):
+                # Pattern: *marketplace*.json
+                pattern = os.path.join(sessions_dir, f"*{marketplace}*.json")
+                potential_sessions = glob.glob(pattern)
+                
+                if potential_sessions:
+                    # Pick the freshest one or random?
+                    # Let's pick random to distribute load if multiple accounts
+                    session_file = random.choice(potential_sessions)
+                    self.log(f"✅ [Worker {worker_id}] Found session: {os.path.basename(session_file)}")
+                else:
+                    self.log(f"⚠️ [Worker {worker_id}] No pre-made session found for {marketplace}. checking legacy path...")
+        except Exception as e:
+            self.log(f"❌ Error finding sessions: {e}")
+
+        # Fallback to legacy path
+        if not session_file:
+             session_file = self.session_manager.get_session_path(marketplace, proxy_data)
         
         # Ensure session exists (warmup if needed)
+        # Only force warmup if we are supposed to have one and don't. 
+        # But if we found one in data/sessions, we are good.
         if not os.path.exists(session_file):
             self.log(f"⚠️ [Worker {worker_id}] Missing session {os.path.basename(session_file)}. Forcing warmup...")
             try:
@@ -938,10 +1180,177 @@ class MonitorEngine:
                             parser = get_parser_for_url(url, page)
                             await parser.Maps(url)
                         else:
-                            await page.goto(url, timeout=60000, wait_until='domcontentloaded')
+                            try:
+                                await page.goto(url, timeout=60000, wait_until='domcontentloaded')
+                            except Exception as nav_err:
+                                err_str = str(nav_err)
+                                if any(x in err_str for x in ('ERR_TIMED_OUT', 'ERR_CONNECTION', 'ERR_PROXY', 'PROXY_CONNECTION')):
+                                    self.log(f"⚠️ PROXY DEAD/SLOW ({proxy['server']}). Rotating to fresh proxy...")
+                                    if os.path.exists(proxy_file):
+                                        os.remove(proxy_file)
+                                        self.log(f"🔄 Sticky proxy deleted. Next attempt picks a fresh IP.")
+                                raise nav_err  # always re-raise to trigger outer retry
                         
                         # Wait for page to settle
                         await asyncio.sleep(random.uniform(settings.DELAY_MIN, settings.DELAY_MAX))
+                        
+                        # --- 🔐 LOGIN VERIFICATION ---
+                        if session_file and marketplace == 'shein':
+                            try:
+                                # --- FIX 4: Improved login status detection with expanded selectors ---
+                                indicators = [
+                                    # Original selectors
+                                    "a[href*='user/path']",
+                                    "i.iconfont-me",
+                                    ".user-info",
+                                    ".header-user",
+                                    ".j-header-user",
+                                    "text='My Orders'",
+                                    # Modern Shein selectors (updated)
+                                    "[class*='header-user']",
+                                    ".she-header__user",
+                                    "a[href*='/user/']",
+                                    ".j-header-user-info",
+                                    "[data-testid='user-icon']",
+                                    ".header__nav-link--user",
+                                    "[class*='user-icon']",
+                                ]
+                                
+                                is_logged_in = False
+                                for ind in indicators:
+                                    try:
+                                        if await page.locator(ind).first.is_visible(timeout=1500):
+                                            is_logged_in = True
+                                            self.log(f"✅ [Worker {worker_id}] Session Verified Active (matched: {ind})")
+                                            break
+                                    except:
+                                        continue
+                                
+                                if not is_logged_in:
+                                    # Negative check: visible "Sign In" button = definitely logged out
+                                    sign_in_visible = False
+                                    for sign_in_sel in ["text='Sign In'", ".j-header-signin", "a[href*='login']"]:
+                                        try:
+                                            if await page.locator(sign_in_sel).first.is_visible(timeout=1500):
+                                                sign_in_visible = True
+                                                break
+                                        except:
+                                            continue
+                                    
+                                    if sign_in_visible:
+                                        self.log(f"⚠️ [Worker {worker_id}] Session Invalid/Expired (Sign In button detected)")
+                                    else:
+                                        # No positive login indicator but also no Sign In button
+                                        # → page loaded normally, assume session is valid
+                                        self.log(f"✅ [Worker {worker_id}] Session likely Active (no Sign In button present)")
+                                # -------------------------------------------------------------------
+                            except Exception as e:
+                                pass
+                        # -----------------------------
+
+                        # --- 📦 CATEGORY / LISTING SCRAPER ---
+                        # Check if we are on a category/list page
+                        card_count = await page.locator(".product-card, .S-product-item, .product-item").count()
+                        if card_count > 0:
+                            self.log(f"📦 [Worker {worker_id}] Detected Category Page ({card_count}+ items). Scraping...")
+                            
+                            # Scroll to load more
+                            for _ in range(3):
+                                await page.mouse.wheel(0, 1000)
+                                await asyncio.sleep(1.5)
+                            
+                            extract_selectors = {
+                                "card": ".product-card, .S-product-item, .product-item",
+                                "name": ["a.goods-title-link", ".S-product-item__name a", ".product-title a", ".S-product-item__name", ".product-title"],
+                                "price": [".S-product-item__price", ".product-price__current-price", ".product-item__price", "span[class*='price']"],
+                                "link": ["a"],
+                                "img": ["img"]
+                            }
+
+                            extracted_data = []
+                            product_cards = await page.locator(extract_selectors["card"]).all()
+                            
+                            for i, card in enumerate(product_cards[:30]): # Cap at 30
+                                try:
+                                    # Name
+                                    name = "Unknown"
+                                    for sel in extract_selectors["name"]:
+                                        el = card.locator(sel).first
+                                        if await el.count() > 0:
+                                            name = await el.text_content()
+                                            break
+                                    
+                                    # Regex Cleaner: Remove -31%, Local-32%, etc.
+                                    name = name.strip()
+                                    name = re.sub(r'^([-]?\d+%|Local-[-]?\d+%)\s*', '', name, flags=re.IGNORECASE).strip()
+                                    
+                                    # Price
+                                    price = "N/A"
+                                    for sel in extract_selectors["price"]:
+                                        el = card.locator(sel).first
+                                        if await el.count() > 0:
+                                            txt = await el.text_content()
+                                            if txt and "$" in txt:
+                                                price = txt.strip()
+                                                break
+                                    
+                                    # Link
+                                    url_found = "N/A"
+                                    el_link = card.locator("a").first
+                                    if await el_link.count() > 0:
+                                        href = await el_link.get_attribute("href")
+                                        if href:
+                                            if href.startswith("//"): href = "https:" + href
+                                            elif href.startswith("/"): href = "https://us.shein.com" + href
+                                            url_found = href
+
+                                    # Image
+                                    img_src = "N/A"
+                                    el_img = card.locator("img").first
+                                    if await el_img.count() > 0:
+                                        src = await el_img.get_attribute("src")
+                                        if not src or "data:image" in src:
+                                            src = await el_img.get_attribute("data-src")
+                                        if src and src.startswith("//"): src = "https:" + src
+                                        img_src = src
+
+                                    extracted_data.append({
+                                        "name": name,
+                                        "price": price,
+                                        "url": url_found,
+                                        "image": img_src
+                                    })
+                                except: continue
+                            
+                            if extracted_data:
+                                # Append to CSV
+                                csv_path = os.path.join("data", "output", f"scraped_{marketplace}.csv")
+                                os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+                                
+                                file_exists = os.path.exists(csv_path) and os.path.getsize(csv_path) > 0
+                                
+                                keys = extracted_data[0].keys()
+                                with open(csv_path, 'a', newline='', encoding='utf-8') as f:
+                                    dw = csv.DictWriter(f, fieldnames=keys)
+                                    if not file_exists:
+                                        dw.writeheader()
+                                    dw.writerows(extracted_data)
+                                
+                                self.log(f"✅ Saved {len(extracted_data)} items to {csv_path}")
+                                
+                                # Since we scraped a category, we might consider this "task" done?
+                                # But let's allow it to fall through to normal parsing if needed, 
+                                # although likely the 'url' was the category.
+                                # If the task was meant to monitor a product, this category detection might be a false positive
+                                # unless the URL IS a category. 
+                                # If it IS a category, we probably don't need to run 'parser' on it which expects product page.
+                                
+                                # If we scraped data, we can return early to avoid errors in parser
+                                await context.close()
+                                await browser.close()
+                                return
+
+                        # ---------------------------------------
                         
                         # Get parser
                         from parsers.site_parsers import get_parser_for_url
@@ -962,6 +1371,9 @@ class MonitorEngine:
                                     
                                     # Check each task against the matrix
                                     for task in group_tasks:
+                                        if not self.running:
+                                            self.log("🛑 STOP signal received inside JSON-LD loop — aborting group.")
+                                            break
                                         t_color = task.get('target_color')
                                         t_size = task.get('target_size')
                                         opt_id = task['option_id']
@@ -993,10 +1405,28 @@ class MonitorEngine:
                                                     break
                                         
                                         if status is not None:
+                                            if isinstance(status, dict):
+                                                status_val = status.get('status', 0)
+                                                p_sale = status.get('price_sale')
+                                                p_orig = status.get('price_orig')
+                                            else:
+                                                status_val = status
+                                                p_sale = None
+                                                p_orig = None
+
                                             # Update DB immediately
-                                            status_text = "In Stock" if status == 0 else "Sold Out"
-                                            await self.db.update_product_option_status(opt_id, status, table="product_options")
-                                            self.log(f"   ✅ Bulk updated {opt_id} ({t_color}/{t_size}): {status_text}")
+                                            status_text = "In Stock" if status_val == 1 else "Sold Out"
+                                            await self.db.update_product_option_status(
+                                                opt_id, status_val,
+                                                table="product_options",
+                                                price=p_sale,
+                                                original_price=p_orig
+                                            )
+                                            await self.db.add_log_entry(
+                                                opt_id, 0, -1, status_val,
+                                                f"[JSON-LD] {marketplace} - {status_text} ({t_color}/{t_size})"
+                                            )
+                                            self.log(f"   ✅ Bulk updated {opt_id} ({t_color}/{t_size}): {status_text} | Sale: {p_sale}, Orig: {p_orig}")
                                             self.update_gui(str(worker_id), task, proxy['server'], status_text)
                                             updated_option_ids.add(opt_id)
 
@@ -1027,6 +1457,9 @@ class MonitorEngine:
                                     dom_matrix_success = True
                                     
                                     for task in remaining_tasks:
+                                        if not self.running:
+                                            self.log("🛑 STOP signal received inside DOM-matrix loop — aborting group.")
+                                            break
                                         t_color = task.get('target_color')
                                         t_size = task.get('target_size')
                                         opt_id = task['option_id']
@@ -1048,15 +1481,40 @@ class MonitorEngine:
                                                         status = k_status
                                                         break
                                         
-                                        status_text = "In Stock" if status == 0 else "Sold Out"
-                                        await self.db.update_product_option_status(opt_id, status, table="product_options")
-                                        self.log(f"   ✓ (DOM) {t_color}/{t_size} -> {status_text}")
+                                        if isinstance(status, dict):
+                                            status_val = status.get('status', 2)
+                                            p_sale = status.get('price_sale')
+                                            p_orig = status.get('price_orig')
+                                        else:
+                                            status_val = status
+                                            p_sale = None
+                                            p_orig = None
+                                            
+                                        status_text = "In Stock" if status_val == 1 else "Sold Out"
+                                        await self.db.update_product_option_status(
+                                            opt_id, status_val,
+                                            table="product_options",
+                                            price=p_sale, original_price=p_orig
+                                        )
+                                        await self.db.add_log_entry(
+                                            opt_id, 0, -1, status_val,
+                                            f"[DOM] {marketplace} - {status_text} ({t_color}/{t_size})"
+                                        )
+                                        self.log(f"   ✓ (DOM) {t_color}/{t_size} -> {status_text} | Sale: {p_sale}, Orig: {p_orig}")
                                         self.update_gui(str(worker_id), task, proxy['server'], status_text)
 
                             if not dom_matrix_success:
                                 self.log(f"⚠️ DOM Matrix failed/skipped. Checking {len(remaining_tasks)} items individually...")
                                 
+                                # Human warmup: idle before first variant click (highest captcha-risk path)
+                                _pre_delay = random.uniform(5, 10)
+                                self.log(f"   ⏸️ Human pause {_pre_delay:.1f}s before variant clicks...")
+                                await asyncio.sleep(_pre_delay)
+                                
                                 for i, task in enumerate(remaining_tasks):
+                                    if not self.running:
+                                        self.log("🛑 STOP signal received inside individual-check loop — aborting group.")
+                                        break
                                     option_id = task['option_id']
                                     target_color = task.get('target_color')
                                     target_size = task.get('target_size')
@@ -1071,11 +1529,27 @@ class MonitorEngine:
                                         else:
                                             result = await parser.parse()
                                             
-                                        status_code = result
-                                        status_text = "In Stock" if status_code == 0 else "Sold Out"
+                                        if isinstance(result, dict):
+                                            status_code = result.get('status', 0)
+                                            p_sale = result.get('price_sale')
+                                            p_orig = result.get('price_orig')
+                                        else:
+                                            status_code = result
+                                            p_sale = None
+                                            p_orig = None
+                                            
+                                        status_text = "In Stock" if status_code == 1 else "Sold Out"
                                         
-                                        await self.db.update_product_option_status(option_id, status_code, table="product_options")
-                                        self.log(f"   ✅ Updated {option_id}: {status_text}")
+                                        await self.db.update_product_option_status(
+                                            option_id, status_code,
+                                            table="product_options",
+                                            price=p_sale, original_price=p_orig
+                                        )
+                                        await self.db.add_log_entry(
+                                            option_id, 0, -1, status_code,
+                                            f"[Individual] {marketplace} - {status_text} ({target_color}/{target_size})"
+                                        )
+                                        self.log(f"   ✅ Updated {option_id}: {status_text} | Sale: {p_sale}, Orig: {p_orig}")
                                         self.update_gui(str(worker_id), task, proxy_url, status_text)
                                         
                                         # Human delay between variants
@@ -1108,16 +1582,18 @@ class MonitorEngine:
                         await context.close()
                         await browser.close()
                         
-                        # 🔥 KILL COOKIES IMMEDIATELY (as requested by user)
-                        try:
-                            if session_file and os.path.exists(session_file):
-                                os.remove(session_file)
-                                self.log(f"🗑️ Deleted compromised session file: {session_file}")
-                        except: pass
+                        # PRESERVE Golden Session (never delete on captcha)
+                        if session_file and os.path.exists(session_file):
+                            self.log(f"⚠️ Captcha encountered. PRESERVING Golden Session: {os.path.basename(session_file)}")
+                            self.log(f"   ℹ️ Session file will NOT be deleted. Triggering 60s cooldown...")
                         
-                        # 🔥 TRIGGER WARMUP with fresh start
+                        # ROTATE PROXY on captcha — flagged IP, pick fresh one on retry
+                        if os.path.exists(proxy_file):
+                            os.remove(proxy_file)
+                            self.log(f"🔄 Proxy rotated after captcha. Next attempt uses fresh IP.")
+                        
+                        # TRIGGER WARMUP
                         try:
-                            self.log(f"🔥 Starting Warmup for {marketplace}...")
                             self.log(f"🔥 Starting Warmup for {marketplace}...")
                             await auto_warmup.handle_captcha(
                                 marketplace, 
@@ -1128,9 +1604,10 @@ class MonitorEngine:
                             self.log(f"✅ Warmup finished. Waiting 60s before retry...")
                             await asyncio.sleep(60)
                         except Exception as warmup_err:
-                            self.log(f"❌ Warmup failed: {warmup_err}")
+                            self.log(f"❌ Warmup failed: {warmup_err}. Cooling down 60s anyway...")
+                            await asyncio.sleep(60)
                         
-                        continue  # Retry with fresh cookies (or no cookies)
+                        continue  # Retry with preserved Golden Session + fresh proxy
                         
                     except Exception as e:
                         self.log(f"❌ Error processing group: {e}")

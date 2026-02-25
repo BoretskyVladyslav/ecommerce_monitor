@@ -9,19 +9,6 @@ from typing import Optional
 
 class SheinParser(BaseParser):
     
-    def _clean_price(self, price_str):
-        if not price_str: return None
-        try:
-            cleaned = re.sub(r'[^\d.]', '', str(price_str))
-            if cleaned.count('.') > 1:
-                parts = cleaned.split('.')
-                cleaned = parts[0] + '.' + ''.join(parts[1:])
-            if cleaned:
-                return float(cleaned)
-        except Exception:
-            pass
-        return None
-
     async def check_for_captcha(self):
         from utils.captcha_detector import captcha_detector
         is_captcha = await captcha_detector.quick_check(self.page, self.marketplace)
@@ -755,27 +742,9 @@ class SheinParser(BaseParser):
                             continue
                         
                         offers = variant.get("offers", {})
-                        if isinstance(offers, list) and len(offers) > 0:
-                            offer = offers[0]
-                        else:
-                            offer = offers
-                            
-                        availability = offer.get("availability", "")
-                        is_in_stock = 1 if "InStock" in availability else 0
-                        
-                        raw_sale = str(offer.get("price", ""))
-                        raw_orig = str(offer.get("highPrice", raw_sale))
-                        
-                        parsed_sale = self._clean_price(raw_sale)
-                        parsed_orig = self._clean_price(raw_orig)
-
-                        self.logger.info(f"🔍 DEBUG PRICE: Raw string found -> Sale: '{raw_sale}', Orig: '{raw_orig}' | Parsed float -> Sale: {parsed_sale}, Orig: {parsed_orig}")
-
-                        variant_matrix[(v_color, size)] = {
-                            "status": is_in_stock,
-                            "price_sale": parsed_sale,
-                            "price_orig": parsed_orig
-                        }
+                        availability = offers.get("availability", "")
+                        is_in_stock = 0 if "InStock" in availability else 2
+                        variant_matrix[(v_color, size)] = is_in_stock
                 
                 except:
                     continue
@@ -859,7 +828,7 @@ class SheinParser(BaseParser):
                     if key in availability_result:
                         return availability_result[key]
                     
-                    for (color, size), status_info in availability_result.items():
+                    for (color, size), status in availability_result.items():
                         color_match = target_color and color.lower().strip() == target_color.lower().strip() if target_color else True
                         
                         if target_size:
@@ -873,15 +842,14 @@ class SheinParser(BaseParser):
                             size_match = True
                         
                         if color_match and size_match:
-                            return status_info
+                            return status
                     
-                    return {"status": 0, "price_sale": None, "price_orig": None}
+                    return 0
                 else:
-                    any_in_stock = any(info.get("status", 0) == 1 for info in availability_result.values() if isinstance(info, dict))
-                    return {"status": 1 if any_in_stock else 0, "price_sale": None, "price_orig": None}
+                    any_in_stock = any(status == 1 for status in availability_result.values())
+                    return 1 if any_in_stock else 0
             
-            gen_avail = await self.check_general_availability()
-            return {"status": gen_avail, "price_sale": None, "price_orig": None}
+            return await self.check_general_availability()
             
         except SoftBanException:
             raise
@@ -889,15 +857,14 @@ class SheinParser(BaseParser):
             raise e
     
     async def get_product_availability(self, target_color=None):
-        results = {}
+        results = []
         
         try:
             color_container_selector = ".main-sales-attr__color-container .radio-container, .main-sales-attr__color .radio-container"
             color_elements = await self.page.locator(color_container_selector).all()
             
             if not color_elements:
-                size_results = await self.get_sizes_for_current_color(None)
-                return {(r["color"], r["size"]): {"status": r["in_stock"], "price_sale": r.get("price_sale"), "price_orig": r.get("price_orig")} for r in size_results}
+                return await self.get_sizes_for_current_color(None)
             
             found_target = False
             
@@ -951,12 +918,7 @@ class SheinParser(BaseParser):
                         pass
                     
                     size_results = await self.get_sizes_for_current_color(color_name)
-                    for sr in size_results:
-                        results[(color_name, sr["size"])] = {
-                            "status": sr["in_stock"],
-                            "price_sale": sr.get("price_sale"),
-                            "price_orig": sr.get("price_orig")
-                        }
+                    results.extend(size_results)
                     
                     if target_color and found_target:
                         break
@@ -970,7 +932,7 @@ class SheinParser(BaseParser):
             return results
             
         except:
-            return {}
+            return []
     
     async def get_sizes_for_current_color(self, color_name):
         size_results = []
@@ -1031,42 +993,15 @@ class SheinParser(BaseParser):
                             pass
                     
                     in_stock = 0 if is_disabled else 1
-                
-                raw_sale = ""
-                raw_orig = ""
-                try:
-                    sale_selectors = [".discount", ".product-intro__content-price span", ".S-product-item__price", ".price-sale"]
-                    for sel in sale_selectors:
-                        if await self.page.locator(sel).count() > 0:
-                            raw_sale = await self.page.locator(sel).first.text_content()
-                            if raw_sale and any(char.isdigit() for char in raw_sale):
-                                break
-                    orig_selectors = [".del-price", ".product-intro__content-price del", "del", ".price-orig"]
-                    for sel in orig_selectors:
-                        if await self.page.locator(sel).count() > 0:
-                            raw_orig = await self.page.locator(sel).first.text_content()
-                            if raw_orig and any(char.isdigit() for char in raw_orig):
-                                break
-                    if not raw_orig:
-                        raw_orig = raw_sale
-                except Exception as e:
-                    self.logger.warning(f"Error extracting DOM prices: {e}")
                     
-                parsed_sale = self._clean_price(raw_sale)
-                parsed_orig = self._clean_price(raw_orig)
-                
-                self.logger.info(f"🔍 DEBUG PRICE: Raw string found -> Sale: '{raw_sale}', Orig: '{raw_orig}' | Parsed float -> Sale: {parsed_sale}, Orig: {parsed_orig}")
-                
-                size_results.append({
-                    "color": color_name,
-                    "size": size_name,
-                    "in_stock": in_stock,
-                    "price_sale": parsed_sale,
-                    "price_orig": parsed_orig
-                })
-                
-            except:
-                continue
+                    size_results.append({
+                        "color": color_name,
+                        "size": size_name,
+                        "in_stock": in_stock
+                    })
+                    
+                except:
+                    continue
             
             return size_results
             
@@ -1182,89 +1117,49 @@ class SheinParser(BaseParser):
             await self.check_for_captcha()
             
             matrix = {}
-        
-        raw_sale = ""
-        raw_orig = ""
-        try:
-            sale_selectors = [".discount", ".product-intro__content-price span", ".S-product-item__price", ".price-sale"]
-            for sel in sale_selectors:
-                if await self.page.locator(sel).count() > 0:
-                    raw_sale = await self.page.locator(sel).first.text_content()
-                    if raw_sale and any(char.isdigit() for char in raw_sale):
-                        break
-            orig_selectors = [".del-price", ".product-intro__content-price del", "del", ".price-orig"]
-            for sel in orig_selectors:
-                if await self.page.locator(sel).count() > 0:
-                    raw_orig = await self.page.locator(sel).first.text_content()
-                    if raw_orig and any(char.isdigit() for char in raw_orig):
-                        break
-            if not raw_orig:
-                raw_orig = raw_sale
-        except Exception as e:
-            self.logger.warning(f"Error extracting DOM prices: {e}")
             
-        parsed_sale = self._clean_price(raw_sale)
-        parsed_orig = self._clean_price(raw_orig)
-        
-        self.logger.info(f"🔍 DEBUG PRICE: Raw string found -> Sale: '{raw_sale}', Orig: '{raw_orig}' | Parsed float -> Sale: {parsed_sale}, Orig: {parsed_orig}")
-
-        size_selectors = [
-            ".product-intro__size-radio",
-            ".product-intro__size-btn",
-            ".size-item",
-            ".product-intro__size-choose .product-intro__size-radio"
-        ]
-        
-        size_elements = []
-        for sel in size_selectors:
-            els = await self.page.locator(sel).all()
-            if els:
-                size_elements = els
-                break
-        
-        if not size_elements:
-            return None
-        
-        for size_el in size_elements:
-            size_name = await size_el.get_attribute("data-attr_value_name")
-            if not size_name:
-                size_name = await size_el.get_attribute("data-size-radio")
-            if not size_name:
-                size_name = await size_el.inner_text()
+            size_selectors = [
+                ".product-intro__size-radio",
+                ".product-intro__size-btn",
+                ".size-item",
+                ".product-intro__size-choose .product-intro__size-radio"
+            ]
             
-            if not size_name:
-                continue
+            size_elements = []
+            for sel in size_selectors:
+                els = await self.page.locator(sel).all()
+                if els:
+                    size_elements = els
+                    break
             
-            class_attr = await size_el.get_attribute("class") or ""
+            if not size_elements:
+                return None
             
-            is_oos = False
-            if "disabled" in class_attr.lower() or "out-of-stock" in class_attr.lower():
-                is_oos = True
-            
-            if not is_oos:
-                if await size_el.get_attribute("disabled"):
+            for size_el in size_elements:
+                size_name = await size_el.get_attribute("data-attr_value_name")
+                if not size_name:
+                    size_name = await size_el.get_attribute("data-size-radio")
+                if not size_name:
+                    size_name = await size_el.inner_text()
+                
+                if not size_name:
+                    continue
+                
+                class_attr = await size_el.get_attribute("class") or ""
+                
+                is_oos = False
+                if "disabled" in class_attr.lower() or "out-of-stock" in class_attr.lower():
                     is_oos = True
+                
+                if not is_oos:
+                    if await size_el.get_attribute("disabled"):
+                        is_oos = True
+                
+                status = 2 if is_oos else 0
+                clean_size = size_name.split('(')[0].strip()
+                matrix[(target_color, clean_size)] = status
             
-            status = 2 if is_oos else 0
-            clean_size = size_name.split('(')[0].strip()
-            matrix[(target_color, clean_size)] = {
-                "status": status,
-                "price_sale": parsed_sale,
-                "price_orig": parsed_orig
-            }
-        
-        return matrix
-        
-    except:
-        return None
-
-    def _clean_price(self, price_str):
-        if not price_str:
+            return matrix
+            
+        except:
             return None
-        try:
-            # Remove currency symbols, commas, and any non-numeric characters except for the decimal point
-            cleaned_price = re.sub(r'[^\d.]', '', price_str)
-            return float(cleaned_price)
-        except ValueError:
-            return None
-```

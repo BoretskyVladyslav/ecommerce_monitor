@@ -1,0 +1,20 @@
+[
+    {
+        "email": "user1@example.com",
+        "password": "SecurePassword123!",
+        "proxy": null,
+        "note": "Primary account"
+    },
+    {
+        "email": "user2@example.com",
+        "password": "AnotherPassword456!",
+        "proxy": "http://username:password@proxy.example.com:8080",
+        "note": "Secondary account with proxy"
+    },
+    {
+        "email": "user3@example.com",
+        "password": "ThirdPassword789!",
+        "proxy": null,
+        "note": "Backup account"
+    }
+]

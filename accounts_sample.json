@@ -1,0 +1,26 @@
+[
+    {
+        "email": "user1@example.com",
+        "password": "SecurePassword123!",
+        "proxy": null,
+        "note": "Primary monitoring account - no proxy"
+    },
+    {
+        "email": "user2@example.com",
+        "password": "AnotherPassword456!",
+        "proxy": "http://username:password@proxy-us-1.example.com:8080",
+        "note": "Secondary account with US proxy"
+    },
+    {
+        "email": "user3@example.com",
+        "password": "ThirdPassword789!",
+        "proxy": "http://proxyuser:proxypass@195.123.45.67:3128",
+        "note": "Backup account with European proxy"
+    },
+    {
+        "email": "monitor4@gmail.com",
+        "password": "MonitorPass2024!",
+        "proxy": null,
+        "note": "Testing account - residential IP"
+    }
+]

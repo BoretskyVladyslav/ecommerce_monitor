@@ -1,147 +1,252 @@
 import customtkinter as ctk
-import asyncio
 import threading
-from fake_useragent import UserAgent
-from database.db_manager import DatabaseManager
+import asyncio
+import os
+import json
+from tkinter import messagebox
+from typing import Optional
+
+# Adjust imports based on project structure
+from utils.browser import BrowserManager
+from parsers.shein import SheinParser
+from utils.session_manager import SessionManager
 
 class SessionModal(ctk.CTkToplevel):
-    def __init__(self, master, session_id=None):
-        super().__init__(master)
-        self.session_id = session_id
-        self.title("Edit Session" if session_id else "Add Session")
-        self.geometry("500x600")
+    def __init__(self, master, **kwargs):
+        super().__init__(master, **kwargs)
         
-        # Make modal
+        self.title("Session Creator - Shein")
+        self.geometry("500x600")
+        self.resizable(False, False)
+        
+        # Managers
+        self.browser_manager = BrowserManager()
+        self.session_manager = SessionManager()
+        
+        # State
+        self.browser_thread: Optional[threading.Thread] = None
+        self.save_requested = False
+        self.browser_running = False
+        self.stop_event = threading.Event()
+        
+        # UI Setup
+        self._create_widgets()
+        
+        # Make modal behavior
         self.transient(master)
         self.grab_set()
-        
-        self.grid_columnconfigure(1, weight=1)
-        
-        # Name
-        ctk.CTkLabel(self, text="Session Name:").grid(row=0, column=0, padx=10, pady=10, sticky="w")
-        self.entry_name = ctk.CTkEntry(self)
-        self.entry_name.grid(row=0, column=1, padx=10, pady=10, sticky="ew")
+        self.focus_set()
 
-        # Type (Dropdown)
-        ctk.CTkLabel(self, text="Marketplace:").grid(row=1, column=0, padx=10, pady=10, sticky="w")
-        self.combo_type = ctk.CTkComboBox(self, values=["amazon", "shein", "temu", "aliexpress"])
-        self.combo_type.grid(row=1, column=1, padx=10, pady=10, sticky="ew")
-
+    def _create_widgets(self):
+        # 1. Inputs Section
+        inputs_frame = ctk.CTkFrame(self)
+        inputs_frame.pack(fill="x", padx=20, pady=20)
+        
+        # Email
+        ctk.CTkLabel(inputs_frame, text="Email:").pack(anchor="w", padx=10, pady=(10, 2))
+        self.entry_email = ctk.CTkEntry(inputs_frame, placeholder_text="user@example.com")
+        self.entry_email.pack(fill="x", padx=10, pady=(0, 10))
+        
+        # Password
+        ctk.CTkLabel(inputs_frame, text="Password:").pack(anchor="w", padx=10, pady=(0, 2))
+        self.entry_password = ctk.CTkEntry(inputs_frame, show="*", placeholder_text="********")
+        self.entry_password.pack(fill="x", padx=10, pady=(0, 10))
+        
         # Proxy
-        ctk.CTkLabel(self, text="Proxy (http://user:pass@ip:port):").grid(row=2, column=0, padx=10, pady=10, sticky="w")
-        self.entry_proxy = ctk.CTkEntry(self)
-        self.entry_proxy.grid(row=2, column=1, padx=10, pady=10, sticky="ew")
-
-        # User Agent
-        ctk.CTkLabel(self, text="User Agent:").grid(row=3, column=0, padx=10, pady=10, sticky="w")
-        self.textbox_ua = ctk.CTkTextbox(self, height=100)
-        self.textbox_ua.grid(row=3, column=1, padx=10, pady=10, sticky="ew")
+        ctk.CTkLabel(inputs_frame, text="Proxy (Optional):").pack(anchor="w", padx=10, pady=(0, 2))
+        self.entry_proxy = ctk.CTkEntry(inputs_frame, placeholder_text="ip:port:user:pass or http://...")
+        self.entry_proxy.pack(fill="x", padx=10, pady=(0, 15))
         
-        # Generate UA Button
-        self.btn_gen_ua = ctk.CTkButton(self, text="Generate Random UA", command=self.generate_ua, fg_color="gray")
-        self.btn_gen_ua.grid(row=4, column=1, padx=10, pady=5, sticky="e")
-
-        # Status (Only for edit)
-        if self.session_id:
-            ctk.CTkLabel(self, text="Status:").grid(row=5, column=0, padx=10, pady=10, sticky="w")
-            self.combo_status = ctk.CTkComboBox(self, values=["Ready", "Wait", "Error", "Run"])
-            self.combo_status.grid(row=5, column=1, padx=10, pady=10, sticky="ew")
-
-        # Save Button
-        self.btn_save = ctk.CTkButton(self, text="Save Session", command=self.on_save, fg_color="green")
-        self.btn_save.grid(row=6, column=0, columnspan=2, padx=10, pady=20)
-
-        # Load data if editing
-        if self.session_id:
-            self.load_session_data()
-        else:
-            self.generate_ua() # Pre-fill for new
-
-    def generate_ua(self):
-        try:
-            # Using default UserAgent() as filters caused library errors
-            ua = UserAgent()
-            new_ua = ua.random
-        except Exception as e:
-            print(f"UA Library Error: {e}")
-            # Minimal fallback just to prevent crash
-            new_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+        # 2. Controls Section
+        controls_frame = ctk.CTkFrame(self, fg_color="transparent")
+        controls_frame.pack(fill="x", padx=20, pady=0)
         
-        self.textbox_ua.delete("0.0", "end")
-        self.textbox_ua.insert("0.0", new_ua)
+        self.btn_launch = ctk.CTkButton(controls_frame, text="🚀 Launch Browser", 
+            command=self.on_launch, height=40, font=("Arial", 14, "bold"))
+        self.btn_launch.pack(fill="x", pady=(0, 10))
+        
+        self.btn_save = ctk.CTkButton(controls_frame, text="💾 Save Session", 
+            command=self.on_save, height=40, font=("Arial", 14, "bold"), 
+            state="disabled", fg_color="gray", hover_color="gray")
+        self.btn_save.pack(fill="x", pady=(0, 10))
+        
+        # 3. Logs Section
+        logs_frame = ctk.CTkFrame(self)
+        logs_frame.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        
+        ctk.CTkLabel(logs_frame, text="Automation Logs:", anchor="w").pack(fill="x", padx=5, pady=5)
+        
+        self.log_box = ctk.CTkTextbox(logs_frame, state="disabled", wrap="word")
+        self.log_box.pack(fill="both", expand=True, padx=5, pady=5)
+        
+    def log(self, message):
+        """Thread-safe logging"""
+        self.after(0, lambda: self._log_internal(message))
+        
+    def _log_internal(self, message):
+        self.log_box.configure(state="normal")
+        self.log_box.insert("end", f">> {message}\n")
+        self.log_box.see("end")
+        self.log_box.configure(state="disabled")
 
-    def load_session_data(self):
-        # Fetch from DB in thread/async
-        def fetch():
-            async def _async_fetch():
-                db = DatabaseManager()
-                await db.init_db() # Ensure pool
-                sessions = await db.fetch_all("SELECT * FROM sessions WHERE id=%s", (self.session_id,))
-                await db.close()
-                return sessions[0] if sessions else None
-
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            data = loop.run_until_complete(_async_fetch())
-            loop.close()
+    def on_launch(self):
+        email = self.entry_email.get().strip()
+        password = self.entry_password.get().strip()
+        proxy = self.entry_proxy.get().strip()
+        
+        if not email or not password:
+            messagebox.showerror("Error", "Email and Password are required!")
+            self.lift() # Bring back to top
+            return
             
-            if data:
-                self.after(0, lambda: self.populate_fields(data))
+        # Disable inputs
+        self.btn_launch.configure(state="disabled")
+        self.entry_email.configure(state="disabled")
+        self.entry_password.configure(state="disabled")
+        self.entry_proxy.configure(state="disabled")
+        
+        self.log("Initializing browser launch sequence...")
+        
+        # Start browser thread
+        self.browser_thread = threading.Thread(
+            target=self._run_browser_task,
+            args=(email, password, proxy),
+            daemon=True
+        )
+        self.browser_thread.start()
+        
+    def _run_browser_task(self, email, password, proxy):
+        try:
+             asyncio.run(self._browser_logic(email, password, proxy))
+        except Exception as e:
+            self.log(f"Thread Error: {e}")
+        
+    async def _browser_logic(self, email, password, proxy_str):
+        self.log("Starting Playwright engine...")
+        
+        session_data = {
+            "type": "shein",
+            "proxy": proxy_str if proxy_str else None,
+            "headless": False,  # MUST be visible for manual interaction
+            "email": email
+        }
+        
+        from playwright.async_api import async_playwright
+        
+        async with async_playwright() as p:
+            try:
+                # 1. Launch Browser
+                self.log(f"Launching stealth browser...")
+                context, browser = await self.browser_manager.get_context(
+                    p, session_data, 
+                    block_resources=False, 
+                    block_images=False,
+                    simplified=False
+                )
+                
+                self.browser_running = True
+                
+                # 2. Navigate
+                page = await context.new_page()
+                parser = SheinParser(page, session_data)
+                
+                self.log("Navigating to Shein login...")
+                try:
+                    await page.goto("https://www.shein.com/user/auth/login", timeout=60000)
+                except Exception as e:
+                    self.log(f"Navigation warning: {e}")
+                
+                # 3. Create Handover State
+                self.log("Handling initial popups...")
+                await parser.close_popups(aggressive=True)
+                
+                self.log("Attempting to auto-fill credentials...")
+                try:
+                    # Typo in user request said "human_type(selector, text)"
+                    # We use the Parser's methods if possible, or fallback to simple type
+                    
+                    # Try Email
+                    typed_email = await parser.human_type("input[type='email']", email)
+                    if not typed_email:
+                         self.log("⚠️ Could not auto-type email. Please type manually.")
+                    else:
+                        await asyncio.sleep(0.5)
+                        
+                    # Try Password
+                    typed_pass = await parser.human_type("input[type='password']", password)
+                    if not typed_pass:
+                        self.log("⚠️ Could not auto-type password.")
+                        
+                except Exception as e:
+                    self.log(f"Auto-fill warning: {e}. Please fill manually.")
 
-        threading.Thread(target=fetch, daemon=True).start()
-
-    def populate_fields(self, data):
-        self.entry_name.delete(0, "end")
-        self.entry_name.insert(0, data['name'])
-        self.combo_type.set(data['type'])
-        if data['proxy']:
-            self.entry_proxy.delete(0, "end")
-            self.entry_proxy.insert(0, data['proxy'])
-        if data['user_agent']:
-            self.textbox_ua.delete("0.0", "end")
-            self.textbox_ua.insert("0.0", data['user_agent'])
-        if hasattr(self, 'combo_status'):
-            self.combo_status.set(data['status'])
+                self.log("--------------------------------------------------")
+                self.log("✅ BROWSER HANDOVER COMPLETE")
+                self.log("--------------------------------------------------")
+                self.log("👉 ACTION REQUIRED:")
+                self.log("1. Solve any Captcha / Slider in the browser.")
+                self.log("2. Click 'Sign In' button.")
+                self.log("3. Verify you are fully logged in.")
+                self.log("4. CLICK 'Save Session' below when done.")
+                
+                # Enable Save Button (Thread-safe)
+                def enable_save():
+                    self.btn_save.configure(state="normal", fg_color="#2ecc71", hover_color="#27ae60")
+                self.after(0, enable_save)
+                
+                # 4. Wait Loop
+                while not self.stop_event.is_set():
+                    # Check if saved requested
+                    if self.save_requested:
+                        self.log("💾 Saving session data...")
+                        
+                        # Save Storage State (Cookies + LocalStorage)
+                        storage = await context.storage_state()
+                        
+                        # Construct filename
+                        safe_email = email.replace("@", "_").replace(".", "_")
+                        filename = f"shein_session_{safe_email}.json"
+                        filepath = os.path.join(self.session_manager.base_dir, filename)
+                        
+                        # Use SessionManager to save
+                        if self.session_manager.save_storage_state(filepath, storage):
+                            self.log(f"✅ Session saved successfully to:\n{filename}")
+                            
+                            # Also save standalone cookies for backup
+                            cookies = await context.cookies()
+                            cookie_path = filepath.replace(".json", "_cookies.json")
+                            self.session_manager.save_cookies(cookie_path, cookies)
+                        else:
+                            self.log("❌ Error saving session file!")
+                        
+                        self.log("Closing browser in 3 seconds...")
+                        await asyncio.sleep(3)
+                        break
+                    
+                    # Check if browser was closed by user
+                    try:
+                        if not context.pages:
+                            self.log("⚠️ Browser closed by user. Session NOT saved.")
+                            break
+                    except:
+                        break
+                        
+                    await asyncio.sleep(0.5)
+                
+                await context.close()
+                await browser.close()
+                self.browser_running = False
+                
+                if self.save_requested:
+                    self.log("Done. Window closing...")
+                    self.after(1500, self.destroy)
+                
+            except Exception as e:
+                self.log(f"CRITICAL ERROR: {e}")
+                import traceback
+                traceback.print_exc()
+                self.browser_running = False
 
     def on_save(self):
-        name = self.entry_name.get()
-        s_type = self.combo_type.get()
-        proxy = self.entry_proxy.get()
-        user_agent = self.textbox_ua.get("0.0", "end").strip()
-        status = self.combo_status.get() if hasattr(self, 'combo_status') else "Ready"
-        
-        if not name:
-            print("Name required")
-            return
-
-        def save_task():
-            async def _async_save():
-                db = DatabaseManager()
-                await db.init_db()
-                
-                if self.session_id:
-                    query = """
-                        UPDATE sessions 
-                        SET name=%s, type=%s, proxy=%s, user_agent=%s, status=%s
-                        WHERE id=%s
-                    """
-                    await db.execute(query, (name, s_type, proxy, user_agent, status, self.session_id))
-                else:
-                    query = """
-                        INSERT INTO sessions (name, type, proxy, user_agent, status)
-                        VALUES (%s, %s, %s, %s, %s)
-                    """
-                    await db.execute(query, (name, s_type, proxy, user_agent, status))
-                
-                await db.close()
-
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(_async_save())
-            loop.close()
-            
-            # Refresh parent
-            self.after(0, self.master.reload_sessions_from_db)
-            self.after(0, self.destroy)
-
-        threading.Thread(target=save_task, daemon=True).start()
+        self.save_requested = True
+        self.btn_save.configure(state="disabled", text="Saving...")
